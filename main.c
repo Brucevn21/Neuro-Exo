@@ -3,4 +3,5 @@
 #include<string.h>
 
 void main() {
+    int stuff = 1;
 }
