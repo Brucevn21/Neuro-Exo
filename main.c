@@ -21,13 +21,27 @@ Last Updated: 4/2/2026
 */
 
 // Related libraries
-#include <Arduino.h>    // Core Teensy 4.1 / Teensyduino framework
-#include <SPI.h>        // SPI bus library
-#include <AS5045.h>     // AS5045 magnetic encoder library
-#include <stdint.h>     // Fixed-width integer types
-#include <stdbool.h>    // Boolean type and true/false constants
-#include <string.h>     // String manipulation functions
-#include <stdio.h>      // Standard I/O functions
+#if defined(__MK20DX256__) //Teensy 3.2 conditional compilation
+    #include "pinMap.h"         // Pin map for Teensy 3.2
+    #define BOARD_NAME "Teensy 3.2"
+
+#elif defined(__IMXRT1062__) //Teensy 4.1 conditional compilation
+    #include "pinMap4.1.h"      // Pin map for Teensy 4.1
+    #define BOARD_NAME "Teensy 4.1"
+
+#else
+    #error "Unsupported board. Please compile for Teensy 3.2 or Teensy 4.1."
+#endif
+
+#include <stdint.h>             // Fixed-width types used by drivers below
+#include <stdbool.h>            // Boolean support for C
+#include <string.h>             // String manipulation functions (memcpy, strlen, strcmp, etc.)
+#include <stdio.h>              // Standard I/O functions (printf, scanf, fprintf, etc.)
+
+#include "AS5045.h"             // Use only if library exposes a C interface; otherwise wrap in extern
+#include "motorDriver.h"        // Use only if library exposes a C interface; otherwise wrap in extern
+#include "luu_utils.h"          // Personal utility library — ensure functions are declared as C linkage
+#include "encoder_utils.h"      // Personal encoder utility library — ensure functions are declared as C linkage
 
 // AS5045 chip select pin
 #define CS_PIN 10
