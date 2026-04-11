@@ -16,7 +16,7 @@ Hardware:
 Control Parameters:
 
 
-Last Updated: 4/2/2026
+Last Updated: 4/10/2026
 
 */
 
@@ -38,8 +38,8 @@ Last Updated: 4/2/2026
 #include <string.h>             // String manipulation functions (memcpy, strlen, strcmp, etc.)
 #include <stdio.h>              // Standard I/O functions (printf, scanf, fprintf, etc.)
 
-#include "AS5045.h"             // Use only if library exposes a C interface; otherwise wrap in extern
-#include "motorDriver.h"        // Use only if library exposes a C interface; otherwise wrap in extern
+#include "AS5045.h"             // New Encoder library change from previous library SPIencoder
+#include "motorDriver.h"        //Library for controlling the motor based on input from Master
 #include "luu_utils.h"          // Personal utility library — ensure functions are declared as C linkage
 #include "encoder_utils.h"      // Personal encoder utility library — ensure functions are declared as C linkage
 
