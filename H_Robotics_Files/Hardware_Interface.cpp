@@ -1278,7 +1278,7 @@ void Hardware_Interface::setModule(string m)
     module = m;
 }
 
-void Hardware_Interface::closeTCPConnection()
+void Hardware_Interface::closeTCPConnection() /////////////////////////////////////////TCIP Block
 {
     for (int i = 0; i < 10; i++)
     {
