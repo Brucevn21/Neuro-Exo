@@ -2,7 +2,7 @@
  * simplified_motor_trigger.ino
  * Receives a single byte from Nano 33 BLE and moves motor for 1 second.
  */
-
+// Bluetooth Test Code for Teensy 4.1 - SPI Slave Example
 #include <SPI.h>
 #include <SPISlave_T4.h>
 #include "motorDriver.h"
@@ -63,7 +63,7 @@ void loop() {
     }
 
     // --- Motor Timing Logic ---
-    if (motorRunning) {
+    if (motorRunning == true) {
         if (millis() - motorStartTime < 1000) {
             motor.rotate(MOVE_VOLTAGE, direction);
         } else {
