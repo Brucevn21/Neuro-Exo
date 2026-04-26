@@ -4,7 +4,6 @@
  */
 // Bluetooth Test Code for Teensy 4.1 - SPI Slave Example
 #include <SPI.h>
-#include <SPISlave_T4.h>
 #include "motorDriver.h"
 #include "pinMap4.1.h" // Assumes Teensy 4.1 based on previous code
 
@@ -38,11 +37,15 @@ void setup() {
     direction.FORWARD  = LOW;
     direction.BACKWARD = HIGH;
 
+    pinMode(LED, OUTPUT);
+    digitalWrite(LED, HIGH); // Ensure LED is off at start
+
     motor.init(motorWiring, motorLimit);
     
     // 4. Start SPI Slave
     mySlave.begin();
-    Serial.println("Teensy Ready. Waiting for 0x01 from Nano...");
+    digitalWrite(LED, LOW);
+    Serial.println("Teensy Ready. Waiting for 0x01 from Nano");
 }
 
 void loop() {
@@ -56,7 +59,7 @@ void loop() {
         Serial.println(received, HEX);
 
         if (received == 0x01) {
-            Serial.println("Triggering motor for 1 second...");
+            Serial.println("Triggering motor for 1 second");
             motorStartTime = millis();
             motorRunning = true;
         }
