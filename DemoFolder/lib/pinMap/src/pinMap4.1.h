@@ -29,3 +29,7 @@
 #define AS5045_CLK_PIN 1 // Clock PIN
 #define AS5045_CS_PIN 2	   // Chip Select
 #define AS5045_DATA_PIN 0	// Data In
+#define CS_PIN 10 // Chip Select pin for SPI Master
+// I2C Communication
+#define I2C_SDA 18          // Connect to Nano A4
+#define I2C_SCL 19          // Connect to Nano A5

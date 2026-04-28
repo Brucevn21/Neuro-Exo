@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "SPISlave_T4-1",
+			"path": "../lib/SPISlave_T4-1"
+		}
+	],
+	"settings": {}
+}
