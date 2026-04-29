@@ -21,15 +21,21 @@ motorDriver motor(1, (char*)"Simple Motor", 3.3f, 8);
 // --- Timing Variables ---
 unsigned long motorStartTime = 0;
 bool motorRunning = false;
-const float MOVE_VOLTAGE = 3.0f;
+const float MOVE_VOLTAGE = -1.0f;
 
 void setup() {
     Serial.begin(115200);
 
+    pinMode(LED,OUTPUT);
+    digitalWrite(LED, HIGH);
     // Motor hardware setup
     motorWiring.enablePin = ENABLE_PIN;
     motorWiring.dirPin    = DIR_PIN;
     motorWiring.pwmPin    = PWM_PIN;
+    motorWiring.BWSwitchPin = 0;
+	motorWiring.FWSwitchPin = 0;
+	digitalWrite(motorWiring.FWSwitchPin, LOW);  //Set to HIGH if pins are set 0 or normal - T3.2
+ 	digitalWrite(motorWiring.BWSwitchPin, LOW); 
     motorLimit.forwardLimit = 150.0f;
     motorLimit.backwardLimit = -150.0f;
     direction.FORWARD  = LOW;
@@ -60,9 +66,9 @@ void loop() {
     // --- Motor Timing Logic (Non-blocking) ---
     if (motorRunning) {
         // Check if time is up
-        if (millis() - motorStartTime >= 3000) {
-            motor.stop();    
-            motor.disable(); 
+        if (millis() - motorStartTime >= 1000) {
+            motor.stop(); 
+            motor.disable();    
             motorRunning = false;
             Serial.println("Sequence Complete.");
         }
