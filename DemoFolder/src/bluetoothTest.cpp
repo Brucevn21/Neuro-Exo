@@ -150,7 +150,7 @@ void setup() {
     digitalWrite(motorWiring.BWSwitchPin, LOW);
 
     // Motor limits
-    motorLimit.forwardLimit = 150.0f;
+    motorLimit.forwardLimit = 35.0f;
     motorLimit.backwardLimit = -150.0f;
 
     // Direction setup
