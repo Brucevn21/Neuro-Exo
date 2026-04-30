@@ -110,17 +110,23 @@ void motorControlISR() {
 /**
  * I2C Interrupt Handler
  * Called when Master sends data
+ * Expected format: [0x01][angle_msb][angle_lsb]
+ * Where angle is a 2-byte signed integer in degrees (big-endian)
  */
 void receiveEvent(int howMany) {
-    while (Wire.available()) {
-        uint8_t received = Wire.read();
-        if (received == 0x01) {
-            // Trigger motor motion to 45 degrees
+    if (Wire.available() >= 3) {
+        uint8_t command = Wire.read();
+        if (command == 0x01) {
+            // Read 2-byte angle (big-endian: MSB first, LSB second)
+            int16_t angle = (int16_t)((Wire.read() << 8) | Wire.read());
+            
             if (!motorMotionActive) {
                 motorMotionActive = true;
-                interpolateEnd = 45.0f;
+                interpolateEnd = (float)angle;
                 interpInitialized = false;
-                Serial.println("I2C Trigger! Starting PID motion to 45 degrees...");
+                Serial.print("I2C Trigger! Starting PID motion to ");
+                Serial.print(angle);
+                Serial.println(" degrees...");
             }
         }
     }
