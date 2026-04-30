@@ -23,6 +23,8 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <bluetooth/bluetooth.h>//Adition of bluetooth capabilities
+#include <bluetooth/rfcomm.h>
 /// Libraries from libsoc that is for gpio management because of the interrupt.
 // #include <libsoc_gpio.h>
 // #include <libsoc_debug.h>
@@ -318,12 +320,20 @@ void Hardware_Interface::startEegStream(int fd, spi_ioc_transfer *transfer)
 void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Channel<Eigen::MatrixXd> *channel1, Channel<Eigen::MatrixXd> *channel2)
 {
     // cout << "Running measure EEG and EOG" << endl;
-    // Connect to Python for BLE transmission (if running debug)
-    connectToPythonServer();
-    if (!pythonConnected)
+    // Connect to Bluetooth device for BLE transmission (if running debug)
+    if (!btConnected)
     {
-        std::cerr << "Failed to connect to Python server in measureEEGEOG" << std::endl;
-        // return;
+        if (!btAddress.empty())
+        {
+            if (!connectToBluetoothDevice(btAddress, btChannel))
+            {
+                std::cerr << "Failed to connect to Bluetooth device in measureEEGEOG" << std::endl;
+            }
+        }
+        else
+        {
+            std::cerr << "Bluetooth address not configured; call setBluetoothDevice() before measureEEGEOG()" << std::endl;
+        }
     }
     // Used for IMU collection
     // gpio_input = libsoc_gpio_request(GPIO_INPUT, LS_GPIO_SHARED);
@@ -425,7 +435,7 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
         if (debug) // for debug eeg mode
         {
             // Send filteredMatrix containing all eeg and eog channels
-            if (pythonConnected)
+            if (btConnected)
             {
                 sendEEGEOGToApp(filteredMatrix);
             }
@@ -507,13 +517,24 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
     }
     cout << "[ENDING]Measure eeg and eog" << endl;
 
-    disconnectPython();
+    disconnectBluetooth();
 }
 // Filters both EOG and EEG channels
 Eigen::MatrixXd Hardware_Interface::FilterVoltage(const Eigen::MatrixXd &voltageMatrix, double HighBound)
 {
-    int rows = voltageMatrix.rows(); // samples (25)
+    int rows = voltageMatrix.rows(); // samples (1)
     int cols = voltageMatrix.cols(); // channels (8)
+
+    // Trying to stop drifting in eeg values by resetinng wh and Pt1 after 10 samples  -> commenting out workaround
+    // hinfSampleCount++;
+    // if (hinfSampleCount >= 10)
+    // {
+    //     hinfSampleCount = 0;
+    //     wh = MatrixXd::Zero(3, 8);
+    //     Pt1 = MatrixXd::Zero(24, 3);
+    //     for (int i = 0; i < 8; i++)
+    //         Pt1.block(i * 3, 0, 3, 3).diagonal().setConstant(0.5);
+    // }
 
     Eigen::MatrixXd outputMatrix(rows, cols);
 
@@ -770,292 +791,15 @@ void Hardware_Interface::changeBuff(unsigned char *hex, int fd, spi_ioc_transfer
 }
 void Hardware_Interface::Arm_setup(double &maxPosition)
 {
-    cout << "[RUNNING] Arm setup" << endl;
-
-    int samplingRate = 50;
-    gV.TARGET = "100";
-    gV.HOME = "0";
-    // string ipAddress = "192.168.0.120"; // Replace with your robot arm's IP -> USE THIS
-    string ipAddress = "127.0.0.1"; // LOCALHOST IP ADDRESS -> USED FOR AT HOME TESTS ONLY
-    int port = 11999;               // Replace with your robot arm's port
+    // TCP arm setup disabled in Bluetooth-only mode.
+    std::cerr << "Arm_setup() disabled: TCP arm control is not used for Bluetooth capability." << std::endl;
     maxPosition = 0.0;
-
-    // Send target to app
-    sendUpdateToPython("target", gV.TARGET);
-
-    for (int i = 0; i < 5000 / samplingRate; i++)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP)
-        {
-            // stop everyting
-            std::exit(0);
-        }
-        usleep(samplingRate * 1000);
-    }
-
-    // RESET
-    gV.REST = false;
-    gV.MOVE = false;
-    gV.IMAGINE_MOVEMENT = false;
-    gV.FIXATE = false;
-    gV.POSITION = (0 > 100) ? "100" : "0";
-
-    // Send position to app
-    sendUpdateToPython("position", gV.POSITION);
-
-    // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
-        perror("Can't create socket");
-        return;
-    }
-
-    // Connect
-    sockaddr_in hint{};
-    hint.sin_family = AF_INET;
-    hint.sin_port = htons(port);
-    inet_pton(AF_INET, ipAddress.c_str(), &hint.sin_addr);
-
-    if (connect(sock, (sockaddr *)&hint, sizeof(hint)) < 0) // IF CANT CONNECT, ARM ISNT CONNECTED SO INFORM APP
-    {
-        perror("Can't connect to server");
-        sendUpdateToPython("ERROR", "ARM"); // sends error message: ERROR=ARM
-        close(sock);
-        return;
-    }
-
-    // Send one command
-    std::string msgToSend = "3\t0.500000\t\n";
-
-    sendWithTimeout(sock, msgToSend, 5000); // only timeout this send
-
-    std::string response;
-    if (recvImmediate(sock, response, 5000, 1000))
-    {
-        // cout << "First receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-    for (int i = 0; i < 3000 / samplingRate; i++)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP)
-        {
-            // stop everyting
-            std::exit(0);
-        }
-        usleep(samplingRate * 1000);
-    }
-
-    gV.THERAPY_STAGE = "prepareForMax";
-
-    // Send therapy_stage to app
-    sendUpdateToPython("therapy_stage", gV.THERAPY_STAGE);
-
-    std::string msgToSendtwo = "7\t0.500000\t\n";
-    sendWithTimeout(sock, msgToSendtwo, 5000); // only timeout this send
-    std::string responsetwo;
-    if (recvImmediate(sock, responsetwo, 5000, 1000))
-    {
-        // cout << "Second receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-
-    usleep(3000 * 1000);
-    cout << "Start now" << endl;
-    std::string msgToSendthree = "0\t0.500000\t\n";
-    for (int i = 0; i < 10000 / samplingRate; i++)
-    {
-        gV.THERAPY_STAGE = "max";
-
-        // Send therapy_stage to app
-        sendUpdateToPython("therapy_stage", gV.THERAPY_STAGE);
-
-        send(sock, msgToSendthree.c_str(), msgToSendthree.size(), 0);
-        string responsethree;
-        if (recvImmediate(sock, responsethree, 5000, 28))
-        {
-            // Cleanup
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\r'), responsethree.end());
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\n'), responsethree.end());
-
-            // Replace ".." with "."
-            size_t pos = 0;
-            while ((pos = responsethree.find("..", pos)) != std::string::npos)
-            {
-                responsethree.replace(pos, 2, ".");
-                pos += 1;
-            }
-
-            // Extract third value
-            std::string thirdValue = extractThirdToken(responsethree);
-            double thirdNum = std::stod(thirdValue);
-            if (thirdNum < 1.0)
-            {
-                thirdNum = 1.0;
-            }
-            gV.POSITION = (thirdNum > 100) ? "100" : thirdValue;
-
-            // Send position to app
-            sendUpdateToPython("position", gV.POSITION);
-
-            if (thirdNum > maxPosition)
-            {
-                maxPosition = thirdNum;
-            }
-            // cout << "Current position: " << thirdNum << endl;
-        }
-
-        usleep(50 * 1000);
-    }
-    for (int i = 0; i < 4000 / samplingRate; i++)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP)
-        {
-            // stop everyting
-            std::exit(0);
-        }
-        usleep(samplingRate * 1000);
-        gV.THERAPY_STAGE = "soon";
-
-        // Send therapy_stage to app
-        sendUpdateToPython("therapy_stage", gV.THERAPY_STAGE);
-    }
-    std::string msgToSendfour = "4\t0.500000\t\n";
-    std::string responsefour;
-    sendWithTimeout(sock, msgToSendfour, 5000);
-    if (recvImmediate(sock, responsefour, 1000, 100))
-    {
-        // cout << "fourth data received succesfully" << endl;
-        // cout << "Fourth response: " << responsefour << endl;
-    }
-    else
-    {
-        cerr << "Fourth data failed to receive";
-    }
-    std::string msgToSendfifth = "7\t0.500000\t\n";
-    sendWithTimeout(sock, msgToSendfifth, 5000);
-    std::string responsefifth;
-    if (recvImmediate(sock, responsefifth, 1000, 100))
-    {
-        // cout << "fifth data received succesfully" << endl;
-        // cout << "Fifth response: " << responsefifth << endl;
-    }
-    else
-    {
-        cerr << "Fifth data failed to receive";
-    }
-    // cout << "\n---" << endl;
-    cout << "Max position reaced: " << maxPosition << endl;
-    // cout << "---\n"
-    //<< endl;
-    // Cleanup
-    // close(sock);
 }
 
 void Hardware_Interface::debugArm()
 {
-    cout << "[RUNNING] Debug arm Module" << endl;
-
-    int samplingRate = 50;
-    // string ipAddress = "192.168.0.120"; // Replace with your robot arm's IP -> USE THIS
-    string ipAddress = "127.0.0.1"; // LOCALHOST IP ADDRESS -> USED FOR AT HOME TESTS ONLY
-    int port = 11999;               // Replace with your robot arm's port
-
-    gV.POSITION = (0 > 100) ? "100" : "0";
-    gV.HOME = "0";
-
-    // Send position to app
-    sendUpdateToPython("position", gV.POSITION);
-
-    // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
-        perror("Can't create socket");
-        return;
-    }
-
-    // Connect
-    sockaddr_in hint{};
-    hint.sin_family = AF_INET;
-    hint.sin_port = htons(port);
-    inet_pton(AF_INET, ipAddress.c_str(), &hint.sin_addr);
-
-    if (connect(sock, (sockaddr *)&hint, sizeof(hint)) < 0) // IF CANT CONNECT, ARM ISNT CONNECTED SO INFORM APP
-    {
-        perror("Can't connect to server");
-        sendUpdateToPython("ERROR", "ARM"); // sends error message: ERROR=ARM
-        close(sock);
-        return;
-    }
-
-    // Send one command
-    std::string msgToSend = "3\t0.500000\t\n";
-
-    sendWithTimeout(sock, msgToSend, 5000); // only timeout this send
-
-    std::string response;
-    if (recvImmediate(sock, response, 5000, 1000))
-    {
-        // cout << "First receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-
-    std::string msgToSendtwo = "7\t0.500000\t\n";
-    sendWithTimeout(sock, msgToSendtwo, 5000); // only timeout this send
-    std::string responsetwo;
-    if (recvImmediate(sock, responsetwo, 5000, 1000))
-    {
-        // cout << "Second receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-
-    std::string msgToSendthree = "0\t0.500000\t\n";
-    bool stop = false;
-    while (!stop)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP) // end next iteration
-            stop = true;
-
-        send(sock, msgToSendthree.c_str(), msgToSendthree.size(), 0);
-        string responsethree;
-        if (recvImmediate(sock, responsethree, 5000, 50))
-        {
-            // Cleanup
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\r'), responsethree.end());
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\n'), responsethree.end());
-
-            // Replace ".." with "."
-            size_t pos = 0;
-            while ((pos = responsethree.find("..", pos)) != std::string::npos)
-            {
-                responsethree.replace(pos, 2, ".");
-                pos += 1;
-            }
-
-            // Extract third value
-            std::string thirdValue = extractThirdToken(responsethree);
-            double thirdNum = std::stod(thirdValue);
-            gV.POSITION = (thirdNum > 100) ? "100" : thirdValue;
-
-            // Send position to app
-            sendUpdateToPython("position", gV.POSITION);
-        }
-
-        usleep(50 * 1000); // arm sampling rate
-    }
+    // TCP arm debug disabled in Bluetooth-only mode.
+    std::cerr << "debugArm() disabled: TCP arm control is not used for Bluetooth capability." << std::endl;
 }
 
 // Helper functions -----------------------------------------------------------------------------------------------
@@ -1133,91 +877,130 @@ std::string Hardware_Interface::extractThirdToken(const std::string &str)
 
 void Hardware_Interface::connectToPythonServer()
 {
-    pythonSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (pythonSocket < 0)
-    {
-        std::cerr << "❌ Failed to create socket for Python server" << std::endl;
-        pythonConnected = false;
-        return;
-    }
-
-    sockaddr_in hint{};
-    hint.sin_family = AF_INET;
-    hint.sin_port = htons(65432);                    // Python server port
-    inet_pton(AF_INET, "127.0.0.1", &hint.sin_addr); // localhost
-
-    // std::cout << "🔌 Connecting to Python BLE server..." << std::endl; // not needed
-
-    if (connect(pythonSocket, (sockaddr *)&hint, sizeof(hint)) < 0)
-    {
-        std::cerr << "❌ Failed to connect to Python server on port 65432" << std::endl;
-        std::cerr << "   Make sure server.py is running!" << std::endl;
-        close(pythonSocket);
-        pythonConnected = false;
-        return;
-    }
-
-    std::cout << "✅ Connected to Python BLE server on port 65432" << std::endl;
-    pythonConnected = true;
+    // TCP bridge disabled in Bluetooth mode. Use connectToBluetoothDevice() instead.
+    pythonConnected = false;
 }
 
 void Hardware_Interface::sendPositionToPython(double position)
 {
-    if (!pythonConnected || pythonSocket < 0)
-    {
-        return;
-    }
-
-    // Send just the position value as a string with newline
-    std::string message = std::to_string(position) + "\n";
-
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
-    if (sent < 0)
-    {
-        std::cerr << "❌ Failed to send position to Python server" << std::endl;
-        pythonConnected = false;
-    }
-    else
-    {
-        std::cout << "📤 Sent position to BLE: " << position << std::endl;
-    }
+    // TCP bridge disabled in Bluetooth mode. Use sendBluetooth() with a proper format instead.
 }
 
 void Hardware_Interface::disconnectPython()
 {
+    // TCP bridge disabled in Bluetooth mode. Use disconnectBluetooth() instead.
     if (pythonSocket >= 0)
     {
         close(pythonSocket);
         pythonSocket = -1;
     }
     pythonConnected = false;
-    std::cout << "🔌 Disconnected from Python server" << std::endl;
 }
-void Hardware_Interface::sendCommandToPython(const std::string &command)
+
+void Hardware_Interface::setBluetoothDevice(const std::string &bdaddr, uint8_t channel)
 {
-    if (!pythonConnected || pythonSocket < 0)
+    btAddress = bdaddr;
+    btChannel = channel;
+}
+
+bool Hardware_Interface::connectToBluetoothDevice(const std::string &bdaddr, uint8_t channel)
+{
+    if (btSocket >= 0)
     {
-        return;
+        disconnectBluetooth();
     }
 
-    std::string message = command + "\n";
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
+    btSocket = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    if (btSocket < 0)
+    {
+        perror("BT socket");
+        btConnected = false;
+        return false;
+    }
 
+    sockaddr_rc addr{};
+    addr.rc_family = AF_BLUETOOTH;
+    addr.rc_channel = channel;
+    str2ba(bdaddr.c_str(), &addr.rc_bdaddr);
+
+    if (connect(btSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("BT connect");
+        close(btSocket);
+        btSocket = -1;
+        btConnected = false;
+        return false;
+    }
+
+    btAddress = bdaddr;
+    btChannel = channel;
+    btConnected = true;
+    std::cout << "✅ Connected to Bluetooth device " << bdaddr << " on channel " << int(channel) << std::endl;
+    return true;
+}
+
+bool Hardware_Interface::sendBluetooth(const std::string &message)
+{
+    if (!btConnected || btSocket < 0)
+        return false;
+
+    ssize_t sent = send(btSocket, message.c_str(), message.size(), 0);
     if (sent < 0)
     {
-        std::cerr << "❌ Failed to send command: " << command << std::endl;
+        perror("BT send");
+        return false;
     }
-    else
+    return true;
+}
+
+void Hardware_Interface::disconnectBluetooth()
+{
+    if (btSocket >= 0)
     {
-        // std::cout << "📤 Sent command: " << command << std::endl;
+        close(btSocket);
+        btSocket = -1;
     }
+    btConnected = false;
+    std::cout << "🔌 Disconnected Bluetooth" << std::endl;
+}
+
+bool Hardware_Interface::receiveBluetooth(std::string &out, int timeoutMs, int maxBytesToRead)
+{
+    if (!btConnected || btSocket < 0)
+        return false;
+
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(btSocket, &readfds);
+
+    timeval timeout;
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+
+    int sel = select(btSocket + 1, &readfds, nullptr, nullptr, &timeout);
+    if (sel > 0 && FD_ISSET(btSocket, &readfds))
+    {
+        std::vector<char> buffer(maxBytesToRead);
+        int bytesReceived = recv(btSocket, buffer.data(), maxBytesToRead, 0);
+        if (bytesReceived > 0)
+        {
+            out.assign(buffer.data(), bytesReceived);
+            return true;
+        }
+    }
+    return false;
+}
+
+void Hardware_Interface::sendCommandToPython(const std::string &command)
+{
+    // TCP bridge disabled in Bluetooth mode. Use sendBluetooth() instead.
 }
 
 void Hardware_Interface::sendFullDataToPython(double eeg1, double eeg2, double eeg3,
                                               double eeg4, double eeg5, double position,
                                               int imagine, int move)
 {
-    if (!pythonConnected || pythonSocket < 0)
+    if (!btConnected || btSocket < 0)
         return;
 
     // Format: "eeg1,eeg2,eeg3,eeg4,eeg5,position,imagine,move\n"
@@ -1228,21 +1011,17 @@ void Hardware_Interface::sendFullDataToPython(double eeg1, double eeg2, double e
         << position << "," << imagine << "," << move << "\n";
 
     std::string message = oss.str();
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
-
-    if (sent < 0)
+    if (!sendBluetooth(message))
     {
-        std::cerr << "❌ Failed to send data to Python" << std::endl;
+        std::cerr << "❌ Failed to send data over Bluetooth" << std::endl;
     }
 }
 void Hardware_Interface::sendEEGEOGToApp(MatrixXd eeg_eog)
 {
-    if (!pythonConnected || pythonSocket < 0)
+    if (!btConnected || btSocket < 0)
         return;
 
     std::ostringstream oss;
-    // oss << std::fixed << std::setprecision(2);
-
     for (int i = 0; i < 8; i++)
     {
         oss << eeg_eog(0, i);
@@ -1252,15 +1031,9 @@ void Hardware_Interface::sendEEGEOGToApp(MatrixXd eeg_eog)
     oss << "\n";
 
     std::string message = oss.str();
-
-    // ADD THIS DEBUG LINE: -> NOT NEEDED ANYMORE
-    // std::cout << "\n Sending to Python: " << message << std::flush;
-
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
-
-    if (sent < 0)
+    if (!sendBluetooth(message))
     {
-        std::cerr << "Failed to send EEG and EOG to Python" << std::endl;
+        std::cerr << "Failed to send EEG and EOG over Bluetooth" << std::endl;
     }
 }
 void Hardware_Interface::debugMode()
@@ -1278,12 +1051,10 @@ void Hardware_Interface::setModule(string m)
     module = m;
 }
 
-void Hardware_Interface::closeTCPConnection() /////////////////////////////////////////TCIP Block
+void Hardware_Interface::closeTCPConnection()
 {
-    for (int i = 0; i < 10; i++)
-    {
-        string msgToSend = "0\t0.000000\t\n";
-        this->sendWithTimeout(sock, msgToSend, 25000);
+    // TCP connection cleanup disabled in Bluetooth-only mode.
+    std::cerr << "closeTCPConnection() disabled: TCP arm connection is not used for Bluetooth capability." << std::endl;
 
         std::string response;
         if (this->recvImmediate(sock, response, 2000, 50))
