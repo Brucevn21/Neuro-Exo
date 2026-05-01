@@ -7,6 +7,11 @@ const int SLAVE_ADDR = 0x08;
 BLEService commandService("180C");
 BLEStringCharacteristic commandChar("2A56", BLEWrite | BLEWriteWithoutResponse, 20); 
 
+// --- Buffering for complete messages ---
+String messageBuffer = "";
+unsigned long lastWriteTime = 0;
+const unsigned long BUFFER_TIMEOUT = 200; // ms 
+
 void setup() {
   Serial.begin(115200);
   Wire.begin(); 
@@ -30,13 +35,13 @@ void sendI2CStartCommand(uint16_t angle) {
   Serial.print("Sending Angle: ");
   Serial.println(angle);
 
-  uint8_t lsb = angle & 0xFF;
   uint8_t msb = (angle >> 8) & 0xFF;
+  uint8_t lsb = angle & 0xFF;
 
   Wire.beginTransmission(SLAVE_ADDR);
   Wire.write(0x01);   // Command byte
+  Wire.write(msb);    // MSB (big-endian)
   Wire.write(lsb);    // LSB
-  Wire.write(msb);    // MSB
   byte error = Wire.endTransmission();
 
   if (error == 0) {
@@ -56,23 +61,35 @@ void loop() {
 
     while (central.connected()) {
       if (commandChar.written()) {
-        // Get the BLE characteristic value as a String
-        String incoming = commandChar.value();
-        incoming.trim();  // remove \n, spaces
-
-        Serial.print("Received string: ");
-        Serial.print(incoming);
+        // Buffer incoming data
+        String newData = commandChar.value();
+        messageBuffer += newData;
+        lastWriteTime = millis();
+        
+        Serial.print("Buffering: ");
+        Serial.println(newData);
+      }
+      
+      // Process complete message after timeout
+      if (messageBuffer.length() > 0 && (millis() - lastWriteTime) > BUFFER_TIMEOUT) {
+        messageBuffer.trim();
+        
+        Serial.print("Complete message: ");
+        Serial.print(messageBuffer);
         Serial.print(" | Length: ");
-        Serial.println(incoming.length());
+        Serial.println(messageBuffer.length());
 
-        // Convert directly to integer
-        uint16_t angle = incoming.toInt();
+        // Convert to integer
+        uint16_t angle = messageBuffer.toInt();
 
         Serial.print("Parsed Angle: ");
         Serial.println(angle);
 
         // Send over I2C
         sendI2CStartCommand(angle);
+        
+        // Clear buffer
+        messageBuffer = "";
       }
     }
 

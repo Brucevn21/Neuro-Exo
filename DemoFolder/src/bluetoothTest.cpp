@@ -36,7 +36,7 @@ unsigned int encBinary;
 float encRaw;
 volatile float encDeg = 0.0f;
 float encRange[2] = {180, -180};
-float encOffset = 0.0f;
+float encOffset = 65.21f;
 int nbits = 16;
 
 // --- PID Control Setup (from main.cpp) ---
@@ -46,7 +46,7 @@ volatile float interpolateEnd = 45.0f; // Target 45 degrees
 volatile float setPointInterpolated = 0.0f;
 volatile int interpCounter = 0;
 volatile bool interpInitialized = false;
-volatile int interpCycles = 4000; // Number of cycles for interpolation
+volatile int interpCycles = 3500; // Number of cycles for interpolation
 volatile float interpIncrement = 0.0f;
 float Vc = 0.0f; // Motor voltage command
 IntervalTimer motorControlTimer;
@@ -156,7 +156,7 @@ void setup() {
     digitalWrite(motorWiring.BWSwitchPin, LOW);
 
     // Motor limits
-    motorLimit.forwardLimit = 35.0f;
+    motorLimit.forwardLimit = 80.0f;
     motorLimit.backwardLimit = -150.0f;
 
     // Direction setup
@@ -167,7 +167,7 @@ void setup() {
     motor.init(motorWiring, motorLimit);
 
     // PID parameters (from main.cpp)
-    jointPID = {0.2f, 0.0f, 0.002f, 0.002f, 0.0f, 0.0f, 0.0f, 0.3f, DerivativeFilterAlpha};
+    jointPID = {0.2f, 0.0f, 0.0002f, 0.002f, 0.0f, 0.0f, 0.0f, 0.3f, DerivativeFilterAlpha};
 
     // Setup motor control interrupt (2ms = 500 Hz)
     motorControlTimer.begin(motorControlISR, 2000);
