@@ -156,6 +156,18 @@ void receiveEvent(int howMany) {
             Serial.print(packet.targetAngleDeg);
             Serial.println(" degrees...");
         }
+    } else if (command == NeuroExoProtocol::I2C_CMD_STOP) {
+        motorMotionActive = false;
+        interpInitialized = false;
+        interpolateEnd = encDeg;
+        setPointInterpolated = encDeg;
+        Vc = 0.0f;
+        motor.disable();
+        jointPID.integral = 0.0f;
+        jointPID.lastError = 0.0f;
+        jointPID.filteredDerivative = 0.0f;
+        ControlAlgorithm_Reset();
+        Serial.println("STOP command received - halting motion.");
     }
 
     // Discard any unread bytes so a malformed packet doesn't desync the bus.

@@ -1,7 +1,11 @@
 /*
  * NeuroExo Rehab Trainer - patient-facing session flow over Web Bluetooth.
- * Talks to Nano33BLEFirmware.ino (service 180C / command 2A56 / telemetry 2A57),
- * which bridges to the Teensy joint controller over I2C.
+ *
+ * Connects to the BeagleBone Black bridge (tools/beaglebone-bridge), which
+ * advertises the same joint service the Nano 33 BLE used to expose directly.
+ * The app is purely a visualizer + session controller now: it picks a speed
+ * and asks for a trial, but the BeagleBone chooses the target angle. All the
+ * app ever learns about the target comes back through telemetry.
  */
 
 // Mechanical travel limits from motorLimit in src/main.cpp, used only to draw
@@ -9,13 +13,15 @@
 const JOINT_MIN_DEG = -150;
 const JOINT_MAX_DEG = 80;
 
-const TARGET_MIN_DEG = 20;
-const TARGET_MAX_DEG = 120;
-
 // A trial counts as "reached" once the encoder stays within this tolerance
 // of the target for a short, debounced stretch (telemetry arrives at 20Hz).
 const REACHED_TOLERANCE_DEG = 4;
 const REACHED_HOLD_SAMPLES = 5;
+
+// Number of telemetry samples to ignore right after requesting a new trial,
+// so a stale target value still in flight can't trigger a false "reached"
+// before the BeagleBone's freshly-chosen target has actually propagated.
+const REACH_DETECTION_WARMUP_SAMPLES = 3;
 
 // Mode isn't yet differentiated by the firmware's control algorithm, so this
 // stays a single constant here rather than exposing a choice the device can't
@@ -23,6 +29,7 @@ const REACHED_HOLD_SAMPLES = 5;
 const SESSION_MODE = NeuroExoProtocol.Mode.Assistive;
 
 const HISTORY_SECONDS = 8;
+const CSV_FILENAME = 'neuroexo_latest_trial.csv';
 
 const el = (id) => document.getElementById(id);
 
@@ -45,6 +52,7 @@ class JointBleClient {
     this.device = null;
     this.commandChar = null;
     this.telemetryChar = null;
+    this.stopChar = null;
     this.onTelemetry = null;
     this.onDisconnected = null;
   }
@@ -62,6 +70,7 @@ class JointBleClient {
     const service = await server.getPrimaryService(NeuroExoProtocol.SERVICE_UUID);
     this.commandChar = await service.getCharacteristic(NeuroExoProtocol.COMMAND_CHAR_UUID);
     this.telemetryChar = await service.getCharacteristic(NeuroExoProtocol.TELEMETRY_CHAR_UUID);
+    this.stopChar = await service.getCharacteristic(NeuroExoProtocol.STOP_CHAR_UUID);
 
     await this.telemetryChar.startNotifications();
     this.telemetryChar.addEventListener('characteristicvaluechanged', (event) => {
@@ -69,12 +78,18 @@ class JointBleClient {
       if (this.onTelemetry) this.onTelemetry(packet);
     });
 
-    return this.device.name || 'NeuroExo device';
+    return this.device.name || 'NeuroExo bridge';
   }
 
-  async sendJointPacket(packet) {
-    const buf = NeuroExoProtocol.encodeJointPacket(packet);
+  // Requests a new trial. Mode/speed are honored; targetAngleDeg is ignored
+  // by the BeagleBone bridge, which substitutes its own random angle.
+  async requestTrial(mode, speed) {
+    const buf = NeuroExoProtocol.encodeJointPacket({ mode, speed });
     await this.commandChar.writeValue(buf);
+  }
+
+  async sendStop() {
+    await this.stopChar.writeValue(new Uint8Array([1]));
   }
 
   disconnect() {
@@ -205,18 +220,63 @@ class HistoryChart {
   }
 }
 
+// ---------- Trial CSV recorder ----------
+// Unlike HistoryChart (a bounded rolling window for the on-screen plot), this
+// keeps every sample of the trial currently in progress so the full trace can
+// be exported once the trial completes. Cleared at the start of each trial,
+// so only the most recently completed trial's data is ever written out.
+
+class TrialRecorder {
+  constructor() {
+    this.samples = []; // {t, current, target, mA}
+    this.startTime = null;
+  }
+
+  reset() {
+    this.samples = [];
+    this.startTime = null;
+  }
+
+  push(currentDeg, targetDeg, milliAmps) {
+    const now = performance.now() / 1000;
+    if (this.startTime === null) this.startTime = now;
+    this.samples.push({ t: now - this.startTime, current: currentDeg, target: targetDeg, mA: milliAmps });
+  }
+
+  toCsv() {
+    const header = 'elapsed_s,current_angle_deg,target_angle_deg,current_mA\n';
+    const rows = this.samples
+      .map((s) => `${s.t.toFixed(3)},${s.current},${s.target},${s.mA}`)
+      .join('\n');
+    return header + rows + '\n';
+  }
+}
+
+function downloadCsv(filename, content) {
+  const blob = new Blob([content], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // ---------- App state machine ----------
 
 const ble = new JointBleClient();
 const dial = setupDial();
 const chart = new HistoryChart(el('historyChart'));
+const recorder = new TrialRecorder();
 
 let selectedSpeed = null;
 let trialNumber = 0;
-let currentTarget = null;
+let trialActive = false;
+let telemetrySamplesSinceTrialStart = 0;
 let initialDistance = 0;
 let reachedStreak = 0;
-let latestCurrentAngle = 0;
 
 function setConnected(connected, label) {
   el('connDot').classList.toggle('connected', connected);
@@ -229,7 +289,7 @@ function refreshStartEnabled() {
   el('startBtn').disabled = !ready;
   el('setupHint').textContent = ready
     ? 'Ready when you are.'
-    : 'Select a speed and connect the device to begin.';
+    : 'Select a speed and connect to the BeagleBone to begin.';
 }
 
 el('speedGroup').addEventListener('click', (event) => {
@@ -247,7 +307,7 @@ el('connectBtn').addEventListener('click', async () => {
     ble.onDisconnected = () => {
       setConnected(false, 'Disconnected');
       el('connectBtn').disabled = false;
-      el('connectBtn').textContent = 'Connect Device';
+      el('connectBtn').textContent = 'Connect to BeagleBone';
     };
     ble.onTelemetry = handleTelemetry;
     const name = await ble.connect();
@@ -257,7 +317,7 @@ el('connectBtn').addEventListener('click', async () => {
     console.error(err);
     setConnected(false, 'Not connected');
     el('connectBtn').disabled = false;
-    el('connectBtn').textContent = 'Connect Device';
+    el('connectBtn').textContent = 'Connect to BeagleBone';
     if (err.name !== 'NotFoundError') {
       alert(`Could not connect: ${err.message}`);
     }
@@ -274,72 +334,93 @@ el('nextTrialBtn').addEventListener('click', () => {
 });
 
 el('quitBtn').addEventListener('click', endSession);
-el('quitDuringTrialBtn').addEventListener('click', endSession);
+
+el('stopBtn').addEventListener('click', async () => {
+  trialActive = false;
+  try {
+    await ble.sendStop();
+  } catch (err) {
+    console.error(err);
+    alert(`Could not send stop command: ${err.message}`);
+  }
+  showScreen('setup');
+  el('setupHint').textContent = 'Motion stopped. Select a speed to start another session.';
+});
 
 function endSession() {
   showScreen('setup');
   el('setupHint').textContent = 'Session ended. Select a speed to start another.';
 }
 
-function randomTargetAngle() {
-  return Math.floor(Math.random() * (TARGET_MAX_DEG - TARGET_MIN_DEG + 1)) + TARGET_MIN_DEG;
-}
-
 async function startNextTrial() {
   trialNumber += 1;
-  currentTarget = randomTargetAngle();
+  trialActive = true;
+  telemetrySamplesSinceTrialStart = 0;
   reachedStreak = 0;
-  initialDistance = Math.abs(latestCurrentAngle - currentTarget) || 1;
+  initialDistance = 0;
 
   el('trialCounter').textContent = `Trial ${trialNumber}`;
-  el('targetReadout').textContent = currentTarget;
-  el('targetReadout2').textContent = `${currentTarget}°`;
+  el('targetReadout').textContent = '--';
+  el('targetReadout2').textContent = '--°';
   el('progressFill').style.width = '0%';
-  el('progressLabel').textContent = '0% there';
+  el('progressLabel').textContent = 'Waiting for target...';
   chart.reset();
+  recorder.reset();
 
   showScreen('trial');
 
   try {
-    await ble.sendJointPacket({
-      mode: SESSION_MODE,
-      speed: selectedSpeed,
-      targetAngleDeg: currentTarget,
-    });
+    await ble.requestTrial(SESSION_MODE, selectedSpeed);
   } catch (err) {
     console.error(err);
-    alert(`Could not send command to device: ${err.message}`);
+    alert(`Could not request a trial: ${err.message}`);
   }
 }
 
 function handleTelemetry(packet) {
-  latestCurrentAngle = packet.currentAngleDeg;
-
   el('currentReadout').textContent = `${packet.currentAngleDeg}°`;
-  updateDial(dial, packet.currentAngleDeg, currentTarget ?? packet.targetAngleDeg);
+  updateDial(dial, packet.currentAngleDeg, packet.targetAngleDeg);
 
-  if (screens.trial.classList.contains('active') && currentTarget !== null) {
-    chart.push(packet.currentAngleDeg, currentTarget);
+  if (!screens.trial.classList.contains('active') || !trialActive) {
+    return;
+  }
 
-    const distance = Math.abs(packet.currentAngleDeg - currentTarget);
-    const progress = Math.min(1, Math.max(0, 1 - distance / initialDistance));
-    el('progressFill').style.width = `${Math.round(progress * 100)}%`;
-    el('progressLabel').textContent = `${Math.round(progress * 100)}% there`;
+  telemetrySamplesSinceTrialStart += 1;
 
-    if (distance <= REACHED_TOLERANCE_DEG) {
-      reachedStreak += 1;
-      if (reachedStreak >= REACHED_HOLD_SAMPLES) {
-        onTargetReached();
-      }
-    } else {
-      reachedStreak = 0;
+  el('targetReadout').textContent = packet.targetAngleDeg;
+  el('targetReadout2').textContent = `${packet.targetAngleDeg}°`;
+
+  chart.push(packet.currentAngleDeg, packet.targetAngleDeg);
+  recorder.push(packet.currentAngleDeg, packet.targetAngleDeg, packet.currentMilliAmps);
+
+  const distance = Math.abs(packet.currentAngleDeg - packet.targetAngleDeg);
+
+  if (telemetrySamplesSinceTrialStart === 1) {
+    initialDistance = distance || 1;
+  }
+
+  const progress = Math.min(1, Math.max(0, 1 - distance / initialDistance));
+  el('progressFill').style.width = `${Math.round(progress * 100)}%`;
+  el('progressLabel').textContent = `${Math.round(progress * 100)}% there`;
+
+  if (telemetrySamplesSinceTrialStart <= REACH_DETECTION_WARMUP_SAMPLES) {
+    return;
+  }
+
+  if (distance <= REACHED_TOLERANCE_DEG) {
+    reachedStreak += 1;
+    if (reachedStreak >= REACHED_HOLD_SAMPLES) {
+      onTargetReached(packet.targetAngleDeg);
     }
+  } else {
+    reachedStreak = 0;
   }
 }
 
-function onTargetReached() {
-  currentTarget = null;
-  el('successSubtitle').textContent = `You reached the target angle on trial ${trialNumber}.`;
+function onTargetReached(targetAngleDeg) {
+  trialActive = false;
+  downloadCsv(CSV_FILENAME, recorder.toCsv());
+  el('successSubtitle').textContent = `You reached ${targetAngleDeg}° on trial ${trialNumber}.`;
   showScreen('success');
 }
 

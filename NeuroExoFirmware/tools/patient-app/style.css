@@ -10,6 +10,8 @@
   --accent: #e0554f;
   --success: #35a06a;
   --border: #dde5f0;
+  --danger: #d5342b;
+  --danger-ink: #ffffff;
   color-scheme: light;
 }
 
@@ -124,6 +126,17 @@ h1 {
   border: 1px solid var(--border);
   border-radius: 10px;
 }
+
+.btn-stop {
+  background: var(--danger);
+  color: var(--danger-ink);
+  margin-top: 18px;
+  padding: 24px;
+  font-size: 1.3rem;
+  letter-spacing: 0.05em;
+  box-shadow: 0 2px 10px rgba(213, 52, 43, 0.35);
+}
+.btn-stop:active { background: #a9241d; }
 
 .hint {
   text-align: center;

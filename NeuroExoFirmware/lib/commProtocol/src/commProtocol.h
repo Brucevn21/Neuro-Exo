@@ -24,6 +24,9 @@ constexpr uint8_t PACKET_SIZE = 7;
 // I2C command byte prefixing a full joint packet sent Nano -> Teensy.
 constexpr uint8_t I2C_CMD_JOINT_PACKET = 0x02;
 
+// I2C command (no payload) requesting an immediate halt of any in-flight motion.
+constexpr uint8_t I2C_CMD_STOP = 0x03;
+
 enum class Mode : uint8_t {
     Resistive = 0,
     Assistive = 1,

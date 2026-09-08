@@ -12,10 +12,13 @@
 const NeuroExoProtocol = {
   PACKET_SIZE: 7,
 
-  // Nano33BLEFirmware.ino BLE UUIDs.
+  // BLE UUIDs, shared with Nano33BLEFirmware.ino and re-served under the
+  // same names by tools/beaglebone-bridge (the app now connects to the
+  // BeagleBone Black, not the Nano, but the wire format is unchanged).
   SERVICE_UUID: 0x180c,
   COMMAND_CHAR_UUID: 0x2a56,
   TELEMETRY_CHAR_UUID: 0x2a57,
+  STOP_CHAR_UUID: 0x2a58,
 
   Mode: { Resistive: 0, Assistive: 1, Neutral: 2 },
   Speed: { Slow: 0, Medium: 1, High: 2 },

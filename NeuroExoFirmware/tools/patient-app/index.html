@@ -29,7 +29,7 @@
       <button class="speed-btn" data-speed="2">Fast</button>
     </div>
 
-    <button class="btn btn-secondary" id="connectBtn">Connect Device</button>
+    <button class="btn btn-secondary" id="connectBtn">Connect to BeagleBone</button>
 
     <button class="btn btn-primary btn-large" id="startBtn" disabled>Start Session</button>
 
@@ -40,7 +40,6 @@
   <section id="screen-trial" class="screen">
     <div class="trial-header">
       <span id="trialCounter">Trial 1</span>
-      <button class="btn btn-quiet" id="quitDuringTrialBtn">Quit</button>
     </div>
 
     <h1 class="instruction">Move your arm to <span id="targetReadout">--</span>&deg;</h1>
@@ -61,6 +60,8 @@
     </div>
 
     <canvas id="historyChart" width="640" height="140"></canvas>
+
+    <button class="btn btn-stop" id="stopBtn">STOP</button>
   </section>
 
   <!-- SUCCESS SCREEN -->
