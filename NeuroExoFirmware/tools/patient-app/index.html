@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NeuroExo Rehab Trainer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">NeuroExo Rehab Trainer</div>
+  <div class="conn-status" id="connStatus">
+    <span class="dot" id="connDot"></span>
+    <span id="connLabel">Not connected</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- SETUP SCREEN -->
+  <section id="screen-setup" class="screen">
+    <h1>Ready for your session?</h1>
+    <p class="subtitle">Choose a speed, connect the device, then press Start.</p>
+
+    <div class="speed-group" id="speedGroup">
+      <button class="speed-btn" data-speed="0">Slow</button>
+      <button class="speed-btn" data-speed="1">Medium</button>
+      <button class="speed-btn" data-speed="2">Fast</button>
+    </div>
+
+    <button class="btn btn-secondary" id="connectBtn">Connect Device</button>
+
+    <button class="btn btn-primary btn-large" id="startBtn" disabled>Start Session</button>
+
+    <p class="hint" id="setupHint">Select a speed and connect the device to begin.</p>
+  </section>
+
+  <!-- TRIAL SCREEN -->
+  <section id="screen-trial" class="screen">
+    <div class="trial-header">
+      <span id="trialCounter">Trial 1</span>
+      <button class="btn btn-quiet" id="quitDuringTrialBtn">Quit</button>
+    </div>
+
+    <h1 class="instruction">Move your arm to <span id="targetReadout">--</span>&deg;</h1>
+
+    <div class="dial-wrap">
+      <svg id="dial" viewBox="-120 -120 240 240" width="320" height="320"></svg>
+      <div class="dial-legend">
+        <div><span class="swatch swatch-current"></span> Current: <strong id="currentReadout">--&deg;</strong></div>
+        <div><span class="swatch swatch-target"></span> Target: <strong id="targetReadout2">--&deg;</strong></div>
+      </div>
+    </div>
+
+    <div class="progress-wrap">
+      <div class="progress-track">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-label" id="progressLabel">0% there</div>
+    </div>
+
+    <canvas id="historyChart" width="640" height="140"></canvas>
+  </section>
+
+  <!-- SUCCESS SCREEN -->
+  <section id="screen-success" class="screen screen-center">
+    <div class="smiley">&#128522;</div>
+    <h1>Great job!</h1>
+    <p class="subtitle" id="successSubtitle">You reached the target angle.</p>
+
+    <div class="success-actions">
+      <button class="btn btn-primary btn-large" id="nextTrialBtn">Next Trial</button>
+      <button class="btn btn-secondary" id="quitBtn">Quit</button>
+    </div>
+  </section>
+
+</main>
+
+<script src="protocol.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

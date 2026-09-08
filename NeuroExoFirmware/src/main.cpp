@@ -44,6 +44,10 @@ volatile float setPointInterpolated = 0.0f;
 volatile int interpCounter = 0;
 volatile bool interpInitialized = false;
 volatile int interpCycles = 3500;
+// Trial duration (motorControlISR runs every 2ms) selected by the commanded Speed.
+const int INTERP_CYCLES_SLOW = 5250;   // ~10.5s move
+const int INTERP_CYCLES_MEDIUM = 3500; // ~7.0s move
+const int INTERP_CYCLES_FAST = 1750;   // ~3.5s move
 volatile float interpIncrement = 0.0f;
 float Vc = 0.0f;
 IntervalTimer motorControlTimer;
@@ -140,6 +144,11 @@ void receiveEvent(int howMany) {
         lastCommandedSpeed = packet.speed;
 
         if (!motorMotionActive) {
+            switch (packet.speed) {
+                case NeuroExoProtocol::Speed::Slow:   interpCycles = INTERP_CYCLES_SLOW; break;
+                case NeuroExoProtocol::Speed::Medium: interpCycles = INTERP_CYCLES_MEDIUM; break;
+                case NeuroExoProtocol::Speed::High:   interpCycles = INTERP_CYCLES_FAST; break;
+            }
             motorMotionActive = true;
             interpolateEnd = (float)packet.targetAngleDeg;
             interpInitialized = false;
