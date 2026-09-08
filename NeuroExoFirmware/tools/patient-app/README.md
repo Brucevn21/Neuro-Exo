@@ -26,7 +26,7 @@ Bluetooth requires a "secure context," so either:
 - Serve the folder locally and open it over `http://localhost`, e.g.:
 
   ```bash
-  cd tools/patient-app
+  cd NeuroExoFirmware/tools/patient-app
   python3 -m http.server 8000
   # then open http://localhost:8000 in Chrome
   ```
