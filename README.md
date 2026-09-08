@@ -19,26 +19,26 @@ Implementation references:
 
 ### Bluetooth to I2C Command Bridge
 
-Motion commands are sent over Bluetooth to an Arduino Nano 33 BLE, which acts as a communication bridge and forwards commands over I2C to the Teensy 4.1 motor controller.
+Motion commands are sent over Bluetooth from the BeagleBone Black to an Arduino Nano 33 BLE, which acts as a communication bridge and forwards commands over I2C to the Teensy 4.1 motor controller.
 
 Data flow:
-1. BLE central sends command payload to Nano 33 BLE.
+1. BeagleBone Black (BLE central) sends command payload to Nano 33 BLE.
 2. Nano 33 BLE parses command values.
 3. Nano 33 BLE transmits command bytes to Teensy 4.1 over I2C.
 4. Teensy 4.1 executes interpolation and motor control.
 
 Implementation references:
-- NeuroExoFirmware/src/Nano33BLEFirmware/Nano33BLEFirmware.ino
+- NeuroExoFirmware/src/Nano33BLEFirmware.ino
 - NeuroExoFirmware/src/main.cpp
 
 ### Power Management System Firmware
 
-The project also includes firmware for a power management subsystem on an Arduino Nano 33 connected to:
+The Nano 33 BLE mediator also runs the power management subsystem for the shared rail, connected to:
 - A relay for load connection/disconnection
 - A buck-converted supply path
 - Polarity protection hardware services
 
-Current PMS logic includes under-voltage protection with hysteresis-based relay control.
+Current PMS logic includes under-voltage protection with hysteresis-based relay control, sampled independently of the BLE/I2C mediation loop so it keeps running whether or not a BLE central is connected.
 
 Implementation reference:
-- PMSFirmware/NeuroExo_PMS_Code.ino
+- NeuroExoFirmware/src/Nano33BLEFirmware.ino
