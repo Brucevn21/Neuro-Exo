@@ -55,6 +55,8 @@ volatile float measuredMotorCurrentA = 0.0f;
 float lastEncDegForDeriv = 0.0f;
 float lastVelDegPerSec = 0.0f;
 unsigned long lastKinematicMicros = 0;
+unsigned long lastStreamTime = 0;
+const unsigned long STREAM_INTERVAL_MS = 20; // 50 Hz feed for the live visualizer
 
 const float CURRENT_SENSOR_ZERO_V = 0.0f;
 const float CURRENT_SENSOR_A_PER_V = 1.0f;
@@ -207,6 +209,23 @@ void loop() {
     int adcCurrent = analogRead(ESCON_AN1);
     float currentVoltage = (3.3f * (float)adcCurrent) / 1023.0f;
     measuredMotorCurrentA = (currentVoltage - CURRENT_SENSOR_ZERO_V) * CURRENT_SENSOR_A_PER_V;
+
+    // Compact CSV line consumed by the Python live joint visualizer.
+    if (currentTime - lastStreamTime >= STREAM_INTERVAL_MS) {
+        lastStreamTime = currentTime;
+        Serial.print("JOINT,");
+        Serial.print(encDeg, 2);
+        Serial.print(',');
+        Serial.print(setPointInterpolated, 2);
+        Serial.print(',');
+        Serial.print(interpolateEnd, 2);
+        Serial.print(',');
+        Serial.print(Vc, 2);
+        Serial.print(',');
+        Serial.print(measuredVelocityDegPerSec, 2);
+        Serial.print(',');
+        Serial.println(motorMotionActive ? 1 : 0);
+    }
 
     if (currentTime - lastDebugTime >= 1000) {
         lastDebugTime = currentTime;
