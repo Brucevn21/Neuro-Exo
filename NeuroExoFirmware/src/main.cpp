@@ -16,9 +16,13 @@
 #include "encoder_utils.h"
 #include "luu_utils.h"
 #include "ControlAlgorithm.h"
+#include "commProtocol.h"
 
 const int SLAVE_ADDR = 0x08;
 volatile bool triggerMotor = false;
+
+volatile NeuroExoProtocol::Mode lastCommandedMode = NeuroExoProtocol::Mode::Neutral;
+volatile NeuroExoProtocol::Speed lastCommandedSpeed = NeuroExoProtocol::Speed::Medium;
 
 motorWiring_t motorWiring;
 motorLimit_t motorLimit;
@@ -62,6 +66,7 @@ const float CURRENT_SENSOR_ZERO_V = 0.0f;
 const float CURRENT_SENSOR_A_PER_V = 1.0f;
 
 void receiveEvent(int howMany);
+void requestEvent();
 void motorControlISR();
 
 void motorControlISR() {
@@ -115,21 +120,53 @@ void motorControlISR() {
 }
 
 void receiveEvent(int howMany) {
-    if (Wire.available() >= 3) {
-        uint8_t command = Wire.read();
-        if (command == 0x01) {
-            int16_t angle = (int16_t)((Wire.read() << 8) | Wire.read());
+    if (howMany < 1) {
+        return;
+    }
 
-            if (!motorMotionActive) {
-                motorMotionActive = true;
-                interpolateEnd = (float)angle;
-                interpInitialized = false;
-                Serial.print("I2C Trigger! Starting PID motion to ");
-                Serial.print(angle);
-                Serial.println(" degrees...");
-            }
+    uint8_t command = Wire.read();
+
+    if (command == NeuroExoProtocol::I2C_CMD_JOINT_PACKET &&
+        Wire.available() >= (int)NeuroExoProtocol::PACKET_SIZE) {
+        uint8_t buf[NeuroExoProtocol::PACKET_SIZE];
+        for (uint8_t i = 0; i < NeuroExoProtocol::PACKET_SIZE; ++i) {
+            buf[i] = Wire.read();
+        }
+
+        NeuroExoProtocol::JointPacket packet;
+        NeuroExoProtocol::decodeJointPacket(buf, packet);
+
+        lastCommandedMode = packet.mode;
+        lastCommandedSpeed = packet.speed;
+
+        if (!motorMotionActive) {
+            motorMotionActive = true;
+            interpolateEnd = (float)packet.targetAngleDeg;
+            interpInitialized = false;
+            Serial.print("BLE/I2C Joint Packet! Starting PID motion to ");
+            Serial.print(packet.targetAngleDeg);
+            Serial.println(" degrees...");
         }
     }
+
+    // Discard any unread bytes so a malformed packet doesn't desync the bus.
+    while (Wire.available()) {
+        Wire.read();
+    }
+}
+
+// Reports current joint state back to the Nano 33 BLE for its telemetry ping-pong buffer.
+void requestEvent() {
+    NeuroExoProtocol::JointPacket packet;
+    packet.mode = lastCommandedMode;
+    packet.speed = lastCommandedSpeed;
+    packet.currentAngleDeg = (int16_t)lroundf(encDeg);
+    packet.targetAngleDeg = (int16_t)lroundf(interpolateEnd);
+    packet.currentMilliAmps = (int16_t)lroundf(measuredMotorCurrentA * 1000.0f);
+
+    uint8_t buf[NeuroExoProtocol::PACKET_SIZE];
+    NeuroExoProtocol::encodeJointPacket(packet, buf);
+    Wire.write(buf, NeuroExoProtocol::PACKET_SIZE);
 }
 
 void setup() {
@@ -171,11 +208,12 @@ void setup() {
 
     Wire.begin(SLAVE_ADDR);
     Wire.onReceive(receiveEvent);
+    Wire.onRequest(requestEvent);
 
     Serial.println("========================================");
     Serial.println("NeuroExoFirmware - Main Controller");
     Serial.println("========================================");
-    Serial.println("I2C Slave Ready. Waiting for 0x01 command...");
+    Serial.println("I2C Slave Ready. Waiting for joint packets...");
     Serial.print("PID Gains - Kp: ");
     Serial.print(jointPID.Kp);
     Serial.print(", Kd: ");
