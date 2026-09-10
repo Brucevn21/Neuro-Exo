@@ -9,18 +9,17 @@ using namespace NeuroExoProtocol;
 //     master toward the Teensy 4.1 motor controller.
 //  2. PMS: under-voltage protection for the shared power rail (relay cutoff).
 const int SLAVE_ADDR = 0x08;
-const unsigned long TELEMETRY_INTERVAL_MS = 20; // 20 Hz telemetry to the BeagleBone Black
+const unsigned long TELEMETRY_INTERVAL_MS = 20; // 50 Hz telemetry to the BeagleBone Black
 
-// Command characteristic: BeagleBone Black -> Nano, 7-byte joint packet (mode/speed/target angle).
+// Command characteristic: BeagleBone Black -> Nano, framed control packet.
 BLEService jointService("180C");
-BLECharacteristic commandChar("2A56", BLEWrite | BLEWriteWithoutResponse, PACKET_SIZE);
-// Telemetry characteristic: Nano -> BeagleBone Black, 7-byte joint packet (current angle/current).
-BLECharacteristic telemetryChar("2A57", BLERead | BLENotify, PACKET_SIZE);
+BLECharacteristic commandChar("2A56", BLEWrite | BLEWriteWithoutResponse, MAX_FRAME_SIZE);
+// Telemetry characteristic: Nano -> BeagleBone Black, framed telemetry packet.
+BLECharacteristic telemetryChar("2A57", BLERead | BLENotify, MAX_FRAME_SIZE);
 
-// Ping-pong buffer: one half is filled with fresh telemetry from the Teensy
-// while the other half (already complete) is safely sent out over BLE.
-JointPacketPingPongBuffer telemetryBuffer;
 unsigned long lastTelemetryTime = 0;
+unsigned long lastCommandByteTime = 0;
+FrameParser commandParser;
 
 // --- Power Management System (under-voltage protection) ---
 // Ported from PMSFirmware/NeuroExo_PMS_Code.ino so a single Nano 33 BLE can
@@ -33,7 +32,8 @@ const float PMS_R1 = 101000.0; // 100k Ohms *Nominal value shown
 const float PMS_R2 = 9900.0;   // 10k Ohms *Nominal value shown
 
 // Voltage settings
-const float PMS_THRESHOLD_VOLTAGE = 22.0; // Lower Voltage limit
+const float PMS_THRESHOLD_VOLTAGE_LOW = 22.0; // Lower Voltage limit
+const float PMS_THRESHOLD_VOLTAGE_HIGH = 32; // Upper Voltage limit for hysteresis
 const float PMS_HYSTERESIS = 0.5;         // Prevents relay chatter (re-engages at 22.5V)
 const unsigned long PMS_CHECK_INTERVAL_MS = 500; // Sample rate for the voltage divider
 
@@ -59,18 +59,55 @@ void checkPowerSupply() {
   // Formula: Vin = Vout * (R1 + R2) / R2
   float vIn = vOut * ((PMS_R1 + PMS_R2) / PMS_R2);
 
-  Serial.print("PMS Input Voltage: ");
-  Serial.print(vIn);
-  Serial.println(" V");
-
-  if (vIn < PMS_THRESHOLD_VOLTAGE) {
+  if (vIn < PMS_THRESHOLD_VOLTAGE_LOW) {
     // Voltage too low! Disconnect the load.
     digitalWrite(PMS_RELAY_PIN, LOW);
-  } else if (vIn > (PMS_THRESHOLD_VOLTAGE + PMS_HYSTERESIS)) {
+  } else if (vIn > (PMS_THRESHOLD_VOLTAGE_HIGH + PMS_HYSTERESIS)) {
     // Voltage is safe and above recovery threshold. Connect load.
     digitalWrite(PMS_RELAY_PIN, HIGH);
   }
   // Otherwise, hold the current relay state (hysteresis dead zone).
+}
+
+const char *modeName(Mode mode) {
+  switch (mode) {
+    case Mode::Resistive: return "Resistive";
+    case Mode::Assistive: return "Assistive";
+    case Mode::Neutral: return "Neutral";
+    default: return "Unknown";
+  }
+}
+
+const char *speedName(Speed speed) {
+  switch (speed) {
+    case Speed::Slow: return "Slow";
+    case Speed::Medium: return "Medium";
+    case Speed::High: return "High";
+    default: return "Unknown";
+  }
+}
+
+void printReceivedCommand(const uint8_t *frame, uint8_t length, const ControlPacket &command) {
+  Serial.println("[Bridge] Packet received from host");
+  Serial.print("RAW: [");
+  for (uint8_t i = 0; i < length; ++i) {
+    if (i > 0) {
+      Serial.print(", ");
+    }
+    Serial.print("0x");
+    if (frame[i] < 0x10) {
+      Serial.print('0');
+    }
+    Serial.print(frame[i], HEX);
+  }
+  Serial.println("]");
+  Serial.print("Target Angle: ");
+  Serial.print(command.targetAngleDeg);
+  Serial.println(" deg");
+  Serial.print("Mode: ");
+  Serial.println(modeName(command.mode));
+  Serial.print("Speed: ");
+  Serial.println(speedName(command.speed));
 }
 
 void setup() {
@@ -96,11 +133,9 @@ void setup() {
   Serial.println("System Ready.");
 }
 
-// Forwards a joint packet received over BLE straight through to the Teensy over I2C.
-void forwardCommandToTeensy(const uint8_t packet[PACKET_SIZE]) {
+void forwardCommandToTeensy(const uint8_t *frame, uint8_t length) {
   Wire.beginTransmission(SLAVE_ADDR);
-  Wire.write(I2C_CMD_JOINT_PACKET);
-  Wire.write(packet, PACKET_SIZE);
+  Wire.write(frame, length);
   byte error = Wire.endTransmission();
 
   if (error != 0) {
@@ -109,21 +144,25 @@ void forwardCommandToTeensy(const uint8_t packet[PACKET_SIZE]) {
   }
 }
 
-// Pulls the latest joint packet from the Teensy and republishes it over BLE
-// using the ping-pong buffer so the notify payload is never torn mid-fill.
 void pollTeensyTelemetry() {
-  int received = Wire.requestFrom(SLAVE_ADDR, (int)PACKET_SIZE);
-  if (received != PACKET_SIZE) {
+  int received = Wire.requestFrom(SLAVE_ADDR, (int)MAX_FRAME_SIZE);
+  if (received <= 0 || received > MAX_FRAME_SIZE) {
     return;
   }
 
-  uint8_t *writeBuf = telemetryBuffer.writeBuffer();
-  for (uint8_t i = 0; i < PACKET_SIZE; ++i) {
-    writeBuf[i] = Wire.read();
+  FrameParser parser;
+  for (int i = 0; i < received; ++i) {
+    parser.push((uint8_t)Wire.read());
+  }
+  Frame frame;
+  TelemetryPacket telemetry;
+  if (!parser.takeFrame(frame) || !decodeTelemetryFrame(frame, telemetry)) {
+    return;
   }
 
-  telemetryBuffer.swap();
-  telemetryChar.writeValue(telemetryBuffer.readBuffer(), PACKET_SIZE);
+  uint8_t encoded[MAX_FRAME_SIZE];
+  uint8_t length = encodeTelemetryFrame(telemetry, encoded);
+  telemetryChar.writeValue(encoded, length);
 }
 
 void loop() {
@@ -140,10 +179,25 @@ void loop() {
       checkPowerSupply();
 
       if (commandChar.written()) {
-        uint8_t packet[PACKET_SIZE];
-        int len = commandChar.readValue(packet, PACKET_SIZE);
-        if (len == PACKET_SIZE) {
-          forwardCommandToTeensy(packet);
+        uint8_t bytes[MAX_FRAME_SIZE];
+        int len = commandChar.readValue(bytes, MAX_FRAME_SIZE);
+        unsigned long now = millis();
+        if (now - lastCommandByteTime > FRAME_TIMEOUT_MS) {
+          commandParser.reset();
+        }
+        lastCommandByteTime = now;
+        if (len > 0 && len <= MAX_FRAME_SIZE) {
+          for (int i = 0; i < len; ++i) {
+            commandParser.push(bytes[i]);
+          }
+          Frame frame;
+          ControlPacket command;
+          if (commandParser.takeFrame(frame) && decodeControlFrame(frame, command)) {
+            uint8_t encoded[MAX_FRAME_SIZE];
+            uint8_t frameLength = encodeControlFrame(command, encoded);
+            printReceivedCommand(encoded, frameLength, command);
+            forwardCommandToTeensy(encoded, frameLength);
+          }
         }
       }
 

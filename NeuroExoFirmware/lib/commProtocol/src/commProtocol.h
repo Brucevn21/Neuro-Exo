@@ -1,17 +1,3 @@
-/*
- * commProtocol.h
- *
- * Shared 7-byte joint data packet used between the BeagleBone/App,
- * the Arduino Nano 33 BLE (BLE <-> I2C bridge), and the Teensy 4.1
- * (motor controller), per the NeuroExo Protocol List.
- *
- * Byte layout (56 bits total):
- *   Byte 0     : Mode (bits 1:0) + Speed (bits 3:2)
- *   Bytes 1-2  : Current Angle [degrees], int16, MSB first
- *   Bytes 3-4  : Target Angle [degrees], int16, MSB first
- *   Bytes 5-6  : Current [mA], int16, MSB first
- */
-
 #ifndef __COMM_PROTOCOL_H__
 #define __COMM_PROTOCOL_H__
 
@@ -19,10 +5,24 @@
 
 namespace NeuroExoProtocol {
 
-constexpr uint8_t PACKET_SIZE = 7;
+constexpr uint8_t START_BYTE = 0x02;
+constexpr uint8_t STOP_BYTE = 0x03;
+constexpr uint8_t MESSAGE_CONTROL = 0x10;
+constexpr uint8_t MESSAGE_TELEMETRY = 0x11;
+constexpr uint8_t CONTROL_PAYLOAD_SIZE = 4;
+constexpr uint8_t TELEMETRY_PAYLOAD_SIZE = 5;
+constexpr uint8_t FRAME_OVERHEAD = 5;
+constexpr uint8_t MAX_PAYLOAD_SIZE = TELEMETRY_PAYLOAD_SIZE;
+constexpr uint8_t MAX_FRAME_SIZE = FRAME_OVERHEAD + MAX_PAYLOAD_SIZE;
+constexpr uint32_t FRAME_TIMEOUT_MS = 25;
+constexpr uint32_t COMMAND_TIMEOUT_MS = 250;
 
-// I2C command byte prefixing a full joint packet sent Nano -> Teensy.
-constexpr uint8_t I2C_CMD_JOINT_PACKET = 0x02;
+enum class TelemetryStatus : uint8_t {
+    None = 0,
+    MotionActive = 1 << 0,
+    CommandTimeout = 1 << 1,
+    InvalidCommand = 1 << 2
+};
 
 enum class Mode : uint8_t {
     Resistive = 0,
@@ -36,42 +36,49 @@ enum class Speed : uint8_t {
     High = 2
 };
 
-struct JointPacket {
+struct __attribute__((packed)) ControlPacket {
     Mode mode = Mode::Neutral;
     Speed speed = Speed::Medium;
-    int16_t currentAngleDeg = 0;
     int16_t targetAngleDeg = 0;
-    int16_t currentMilliAmps = 0;
 };
 
-void encodeJointPacket(const JointPacket &packet, uint8_t buf[PACKET_SIZE]);
-void decodeJointPacket(const uint8_t buf[PACKET_SIZE], JointPacket &packet);
+struct __attribute__((packed)) TelemetryPacket {
+    int16_t currentAngleDeg = 0;
+    int16_t currentMilliAmps = 0;
+    uint8_t status = 0;
+};
 
-// Double buffer that lets one 7-byte packet be filled with fresh data
-// while the previously completed packet is safely transmitted over BLE.
-class JointPacketPingPongBuffer {
+struct Frame {
+    uint8_t type = 0;
+    uint8_t length = 0;
+    uint8_t payload[MAX_PAYLOAD_SIZE] = {};
+};
+
+uint8_t crc8(const uint8_t *data, uint8_t length);
+uint8_t encodeControlFrame(const ControlPacket &packet, uint8_t *frame);
+uint8_t encodeTelemetryFrame(const TelemetryPacket &packet, uint8_t *frame);
+bool decodeControlFrame(const Frame &frame, ControlPacket &packet);
+bool decodeTelemetryFrame(const Frame &frame, TelemetryPacket &packet);
+
+class FrameParser {
 public:
-    JointPacketPingPongBuffer() : activeIndex_(0) {
-        for (uint8_t i = 0; i < 2; ++i) {
-            for (uint8_t j = 0; j < PACKET_SIZE; ++j) {
-                buffers_[i][j] = 0;
-            }
-        }
-    }
-
-    // Buffer currently safe to fill with new data.
-    uint8_t *writeBuffer() { return buffers_[1 - activeIndex_]; }
-
-    // Most recently completed packet, safe to read/transmit.
-    const uint8_t *readBuffer() const { return buffers_[activeIndex_]; }
-
-    // Publish the write buffer as the new read buffer.
-    void swap() { activeIndex_ = 1 - activeIndex_; }
+    FrameParser();
+    void reset();
+    void push(uint8_t value);
+    bool hasFrame() const { return frameReady_; }
+    bool takeFrame(Frame &frame);
 
 private:
-    uint8_t buffers_[2][PACKET_SIZE];
-    volatile uint8_t activeIndex_;
+    enum class State : uint8_t { WaitingForStart, Type, Length, Payload, Checksum, Stop };
+    State state_;
+    Frame frame_;
+    uint8_t payloadIndex_;
+    uint8_t checksum_;
+    bool frameReady_;
 };
+
+static_assert(sizeof(ControlPacket) == CONTROL_PAYLOAD_SIZE, "Control payload layout changed");
+static_assert(sizeof(TelemetryPacket) == TELEMETRY_PAYLOAD_SIZE, "Telemetry payload layout changed");
 
 } // namespace NeuroExoProtocol
 
