@@ -32,9 +32,9 @@ const float PMS_R1 = 101000.0; // 100k Ohms *Nominal value shown
 const float PMS_R2 = 9900.0;   // 10k Ohms *Nominal value shown
 
 // Voltage settings
-const float PMS_THRESHOLD_VOLTAGE_LOW = 22.0; // Lower Voltage limit
-const float PMS_THRESHOLD_VOLTAGE_HIGH = 32; // Upper Voltage limit for hysteresis
-const float PMS_HYSTERESIS = 0.5;         // Prevents relay chatter (re-engages at 22.5V)
+const float PMS_THRESHOLD_VOLTAGE = 22.0;   // Lower Voltage limit
+const float PMS_OVERVOLTAGE_CUTOFF = 30.0;  // Upper Voltage limit
+const float PMS_HYSTERESIS = 0.5;           // Prevents relay chatter (re-engages between 22.5V and 32.0V)
 const unsigned long PMS_CHECK_INTERVAL_MS = 500; // Sample rate for the voltage divider
 
 unsigned long lastPMSCheckTime = 0;
@@ -59,11 +59,15 @@ void checkPowerSupply() {
   // Formula: Vin = Vout * (R1 + R2) / R2
   float vIn = vOut * ((PMS_R1 + PMS_R2) / PMS_R2);
 
-  if (vIn < PMS_THRESHOLD_VOLTAGE_LOW) {
+  if (vIn < PMS_THRESHOLD_VOLTAGE) {
     // Voltage too low! Disconnect the load.
     digitalWrite(PMS_RELAY_PIN, LOW);
-  } else if (vIn > (PMS_THRESHOLD_VOLTAGE_HIGH + PMS_HYSTERESIS)) {
-    // Voltage is safe and above recovery threshold. Connect load.
+  } else if (vIn > PMS_OVERVOLTAGE_CUTOFF) {
+    // Voltage too high! Disconnect the load.
+    digitalWrite(PMS_RELAY_PIN, LOW);
+  } else if (vIn > (PMS_THRESHOLD_VOLTAGE + PMS_HYSTERESIS) &&
+             vIn < (PMS_OVERVOLTAGE_CUTOFF - PMS_HYSTERESIS)) {
+    // Voltage is safe and inside both recovery thresholds. Connect load.
     digitalWrite(PMS_RELAY_PIN, HIGH);
   }
   // Otherwise, hold the current relay state (hysteresis dead zone).

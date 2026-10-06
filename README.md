@@ -38,7 +38,7 @@ The Nano 33 BLE mediator also runs the power management subsystem for the shared
 - A buck-converted supply path
 - Polarity protection hardware services
 
-Current PMS logic includes under-voltage protection with hysteresis-based relay control, sampled independently of the BLE/I2C mediation loop so it keeps running whether or not a BLE central is connected.
+Current PMS logic includes under-voltage (22.0 V) and over-voltage (32.5 V) protection with hysteresis-based relay control, sampled independently of the BLE/I2C mediation loop so it keeps running whether or not a BLE central is connected.
 
 Implementation reference:
 - NeuroExoFirmware/src/Nano33BLEFirmware.ino
