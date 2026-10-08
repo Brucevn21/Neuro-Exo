@@ -1,0 +1,33 @@
+# Debian Buster on the BBB supplies CMake 3.13.4.
+cmake_minimum_required(VERSION 3.13)
+project(neuroexo_ble LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0)
+find_package(Threads REQUIRED)
+add_library(neuroexo_ble BluezGatt.cpp BleTrialClient.cpp)
+target_include_directories(neuroexo_ble PUBLIC .)
+target_link_libraries(neuroexo_ble PUBLIC PkgConfig::GIO Threads::Threads)
+target_compile_options(neuroexo_ble PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(neuroexo_ble_trial examples/ble_trial.cpp)
+target_link_libraries(neuroexo_ble_trial PRIVATE neuroexo_ble)
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(bluez_integration tests/bluez_integration.cpp)
+  target_link_libraries(bluez_integration PRIVATE neuroexo_ble)
+  add_test(NAME bluez_integration COMMAND bluez_integration)
+  set_tests_properties(bluez_integration PROPERTIES TIMEOUT 30)
+endif()
+# Hardware_Interface.cpp additionally requires the original EEG/IMU application
+# dependencies, absent from this partial repository. Link that application to
+# neuroexo_ble; this standalone target runs the complete BLE trial protocol.
+
+option(NEUROEXO_TEST_SENSOR_STUBS "Compile hardware class with test-only driver substitutes" OFF)
+if(BUILD_TESTING AND NEUROEXO_TEST_SENSOR_STUBS)
+  find_package(Eigen3 REQUIRED NO_MODULE)
+  add_executable(hardware_interface_check tests/hardware_interface_check.cpp Hardware_Interface.cpp)
+  target_include_directories(hardware_interface_check PRIVATE tests/hardware_stubs)
+  target_link_libraries(hardware_interface_check PRIVATE neuroexo_ble Eigen3::Eigen)
+  add_test(NAME hardware_interface_check COMMAND hardware_interface_check)
+endif()

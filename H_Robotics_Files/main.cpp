@@ -3,6 +3,7 @@
 #include "imu.hpp"
 #include "amp.hpp"
 #include <stdio.h>
+#include <cstdlib>
 #include <sys/time.h>
 #include <unistd.h>
 #include <iostream>
@@ -163,6 +164,13 @@ string train_svm(
 
 int main(int argc, char **argv)
 {
+    // Configure BLE endpoints without connecting during sensor initialization.
+    if (const char* address = std::getenv("NEUROEXO_NANO_ADDRESS")) {
+        cal.hI.setBluetoothDevice(address);
+        test.hI.setBluetoothDevice(address);
+        top_hI.setBluetoothDevice(address);
+    }
+
     // Calling thread USED TO READ DATA COMING IN FROM APP
     std::thread reader(inputThread);
     reader.detach(); // runs independently
@@ -318,8 +326,12 @@ int main(int argc, char **argv)
             gV.THERAPY_STAGE = "";
             // Send updated therapy_stage to app
             sendUpdateToPython("therapy_stage", gV.THERAPY_STAGE);
-            top_hI.debugArm();
-            top_hI.closeTCPConnection(); // close the TCP connection
+            try {
+                top_hI.debugArm();
+            } catch (const std::exception& error) {
+                std::cerr << "Arm BLE debug failed: " << error.what() << std::endl;
+            }
+            top_hI.disconnectBluetooth();
             command.store(7);            // go back to default do nothing state (just in case but it should end completely)
             break;
         case 6: // Synchron / iPad test

@@ -1,0 +1,6 @@
+__pycache__/
+tests/__pycache__/
+.venv/
+ble_benchmark*.csv
+build-ble/
+protocol_trace*.jsonl

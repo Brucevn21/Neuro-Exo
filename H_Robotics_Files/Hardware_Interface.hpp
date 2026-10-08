@@ -2,6 +2,10 @@
 #define HARDWARE_INTERFACE_HPP
 
 #include <cstdint>
+#include <array>
+#include <memory>
+#include <functional>
+#include "BleTrialClient.hpp"
 #include <string>
 #include <list>
 #include <linux/spi/spidev.h>
@@ -9,9 +13,6 @@
 #include <eigen3/Eigen/Dense>
 #include <vector>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <eigen3/Eigen/Core>
 #include "channel.hpp" //contains class to act as EEG channel between submodules
 #include "imu.hpp"     //contains imu class
@@ -27,6 +28,10 @@ using namespace Eigen;
 class Hardware_Interface
 {
 public:
+    Hardware_Interface();
+    ~Hardware_Interface();
+    Hardware_Interface(const Hardware_Interface&) = delete;
+    Hardware_Interface& operator=(const Hardware_Interface&) = delete;
     /// Nicknames to shorten declaration of matrices
     typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> MatrixXd;
     typedef Eigen::Matrix<double, Eigen::Dynamic, 1> VectorXd;
@@ -37,14 +42,14 @@ public:
     uint8_t tx_buff_2[27];
     uint8_t rx_buff_2[27];
     uint32_t spi_speed = 16000000;
-    int fd;
+    int fd = -1;
     int ret;
     double volts[8]; // Stores converted voltages per channel
-    struct spi_ioc_transfer trx;
+    struct spi_ioc_transfer trx{};
     uint32_t scratch32;
-    Filter *filtering;
-    Filter *high_pass;
-    uint8_t num_to_convert[4];
+    Filter *filtering = nullptr;
+    Filter *high_pass = nullptr;
+    uint8_t num_to_convert[24]{};
     list<string> s;
 
     list<VectorXd> filtered;
@@ -56,24 +61,16 @@ public:
 
     MatrixXd Pt1 = MatrixXd(24, 3); // 24x3 (8 channels x 3 states, by 3) - changed from 15x3 (5 channels × 3 states, by 3)
 
-    MatrixXd Pt = Pt1.block<3, 3>(0, 0, 3, 3);
-    MatrixXd wh = MatrixXd(3, 5); // 3x8 (3 states x 8 channels) - changed from 3x5 (3 states × 5 channels) <- Initialize wh matrix
+    MatrixXd Pt = MatrixXd::Zero(3, 3);
+    MatrixXd wh = MatrixXd::Zero(3, 8); // Three states for each of eight channels
     int hinfSampleCount = 0;      // used in hinf function to reset Pt1 and wh
 
     // Command + gain control
     uint8_t hexes[27] = {0};
     int gainValues[7] = {1, 2, 4, 6, 8, 12, 24};
     uint8_t gainHexValues[7] = {0x08, 0x18, 0x28, 0x38, 0x48, 0x58, 0x68};
-    int ampEog;
-    int ampEeg;
-    int sock; // used as handle to arm throughout the trials
-
-    // Bluetooth (BlueZ RFCOMM)
-    int btSocket = -1;
-    bool btConnected = false;
-    std::string btAddress = "";
-    uint8_t btChannel = 1;
-
+    int ampEog = 6;
+    int ampEeg = 0;
     // IMU
     Imu imu_cp;
 
@@ -88,8 +85,6 @@ public:
     void Arm_setup(double &maxPosition);
     // Debug arm
     void debugArm();
-    // Close connection
-    void closeTCPConnection();
 
     Eigen::MatrixXd FilterVoltage(const Eigen::MatrixXd &voltageMatrix, double HighBound);
     Eigen::MatrixXd HInfFilter(const Eigen::MatrixXd &voltageMatrix);
@@ -105,25 +100,23 @@ public:
     void testAmp();
     void toVoltage(uint8_t number[]);
 
-    // Socket communication to Python BLE server------------------------------------------------
-    int pythonSocket;
-    bool pythonConnected;
-    void sendCommandToPython(const string &command);
-    void connectToPythonServer();
-    void sendPositionToPython(double position);
-    void disconnectPython();
-    void sendFullDataToPython(double eeg1, double eeg2, double eeg3,
-                              double eeg4, double eeg5, double position,
-                              int imagine, int move);
-    void sendEEGEOGToApp(MatrixXd eeg_eog);
-
-    // BlueZ RFCOMM Bluetooth helpers ------------------------------------------------------------
-    void setBluetoothDevice(const string &bdaddr, uint8_t channel = 1);
-    bool connectToBluetoothDevice(const string &bdaddr, uint8_t channel = 1);
-    bool sendBluetooth(const string &message);
+    // BlueZ BLE GATT trial protocol. Use one owner thread for arm operations.
+    void setBluetoothDevice(const std::string& address, const std::string& adapter = "hci0");
+    bool connectToBluetoothDevice();
     void disconnectBluetooth();
-    bool receiveBluetooth(std::string &out, int timeoutMs, int maxBytesToRead = 1000);
-    // ------------------------------------------------------------------------------------------------
+    bool isBluetoothConnected() const;
+    bool isBluetoothSimulated() const;
+    void calibrateArm();
+    void setMaxPosition(double degrees);
+    void configureTrial(const neuroexo::TrialSettings& settings);
+    void startTrial(uint16_t trial);
+    neuroexo::ArmPosition readArmPosition(uint16_t trial);
+    void endTrial(uint16_t trial);
+    double lastArmPositionDegrees() const { return double(armPositionMilliDegrees_.load()) / neuroexo::SCALE; }
+    neuroexo::TrialTiming runArmTrial(
+        const neuroexo::TrialSettings& settings, std::chrono::milliseconds duration,
+        std::function<void(const neuroexo::ArmPosition&)> onPosition = {},
+        std::function<bool()> shouldStop = {});
 
     // Enter debug mode (used when not connected to ARM)
     void debugMode();
@@ -131,13 +124,15 @@ public:
     // Let class know which module it belongs to
     void setModule(string m);
 
-    // Helper functions --------------------------------------------------------------------
-    bool recvImmediate(int sock, string &out, int timeoutMs, int maxBytesToRead = 1000);
-    bool sendWithTimeout(int sock, const string &data, int timeoutMs);
-    std::string extractThirdToken(const string &str);
-    //----------------------------------------------------------------------------------------------
-
 private:
+    void requireBluetooth();
+    void logEEGEOG(const MatrixXd& values);
+    std::unique_ptr<neuroexo::BleTrialClient> ble_;
+    std::string btAddress;
+    std::string btAdapter = "hci0";
+    std::atomic<int32_t> armPositionMilliDegrees_{0};
+    std::array<std::unique_ptr<Filter>, 8> highPassFilters_, lowPassFilters_;
+    double highPassCutoff_ = -1.0;
     bool debug = false;
     string module = "";
 };
