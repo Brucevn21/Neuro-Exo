@@ -8,6 +8,10 @@ Control commands travel from the BeagleBone to the Nano over BLE, then from the 
 
 Messages use framed binary packets with start/stop markers, payload length, and CRC-8 validation. Control frames are 9 bytes; telemetry frames are 10 bytes. See the detailed [communication protocol documentation](lib/commProtocol/README.md).
 
+## Wiring
+
+Pin assignments and board-to-board connections for the Teensy 4.1 and Nano 33 BLE are in the [connection map](lib/pinMap/README.md).
+
 ## Build
 
 This is a PlatformIO project with separate environments for the Teensy 4.1 and Nano 33 BLE:
