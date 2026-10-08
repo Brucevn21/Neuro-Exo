@@ -1,13 +1,33 @@
 /*
  * ControlAlgorithm.cpp
  *
- * Position-based assist controller for the NeuroExo motor arm.
+ * Torque-based assist/resist controller for the NeuroExo joint, following
+ * "Overview on Control Algorithm Robot Arm" (Scenario A: current-based, no
+ * torque sensor, Option A assistance). The ESCON runs in current mode, so the
+ * output is a motor current and torque = Kt * I * N * eta at the joint.
  *
- * This implementation is deliberately safe-by-default:
- * - Known motor hardware values are populated.
- * - Calibration parameters are initialized to zero and remain zero until
- *   measured/validated on the hardware.
- * - The controller outputs zero while configuration is incomplete.
+ * Assist (Assistive / Neutral modes):
+ *   tau_required = Kp*(setpoint - angle) + Kd*(setpointVel - vel) + tau_gravity
+ *   tau_robot    = assistance * tau_required
+ *   The tracking part never pushes away from the final target (PDF Part 6).
+ *
+ * Resist:
+ *   tau_robot = -resistDamping * vel + tau_gravity
+ *   Opposes motion in either direction and holds the limb's weight, so the
+ *   patient works against pure damping. (The PDF's "-50% x tau_required"
+ *   would drive the joint away from the target on its own, so it isn't used.)
+ *
+ * Both modes:
+ *   Above softVelocityLimit, extra damping proportional to the excess speed
+ *   slows the patient down smoothly. Above hardVelocityLimit, or with
+ *   sustained overcurrent, the controller latches ESTOP_FAULT and outputs 0.
+ *
+ * Measured current can't isolate patient effort here: in current mode the
+ * ESCON makes measured current track the command. It is used for overcurrent
+ * protection and reported as measuredTorqueNm for logging.
+ *
+ * Safe by default: calibration values start at 0 and the controller outputs
+ * 0 (UNINITIALIZED) until a complete config is set.
  */
 
 #include <Arduino.h>
@@ -26,210 +46,157 @@ static inline float clampf(float value, float minValue, float maxValue) {
     return value;
 }
 
-static inline bool isValidFloat(float value) {
-    return isfinite(value);
+static inline float signf(float value) {
+    return (value > 0.0f) ? 1.0f : ((value < 0.0f) ? -1.0f : 0.0f);
 }
 
 static inline bool configReady(const ControlConfig &cfg) {
-    return cfg.kpNmPerRad > 0.0f &&
-           cfg.kdNmSPerRad > 0.0f &&
-           cfg.massKg > 0.0f &&
-           cfg.centerOfMassM > 0.0f &&
-           cfg.maxVelocityRadPerSec > 0.0f &&
-           cfg.emergencyTorqueNm > 0.0f &&
-           cfg.assistance > 0.0f &&
-           cfg.velocityFilterAlpha > 0.0f &&
-           cfg.velocityFilterAlpha <= 1.0f &&
-           cfg.commandVoltagePerAmp > 0.0f;
+    return cfg.torqueConstantNmPerA > 0.0f &&
+           cfg.gearRatio > 0.0f &&
+           cfg.transmissionEfficiency > 0.0f &&
+           cfg.esconFullScaleCurrentA > 0.0f &&
+           cfg.kpNmPerRad > 0.0f &&
+           cfg.kdNmSPerRad >= 0.0f &&
+           cfg.massKg >= 0.0f &&
+           cfg.centerOfMassM >= 0.0f &&
+           cfg.resistDampingNmSPerRad >= 0.0f &&
+           cfg.softVelocityLimitRadPerSec > 0.0f &&
+           cfg.overspeedDampingNmSPerRad >= 0.0f &&
+           cfg.hardVelocityLimitRadPerSec > cfg.softVelocityLimitRadPerSec &&
+           cfg.maxTorqueNm > 0.0f &&
+           cfg.maxCurrentA > 0.0f &&
+           cfg.maxCurrentA <= cfg.continuousCurrentLimitA &&
+           cfg.overcurrentTripA > 0.0f &&
+           cfg.overcurrentTicks > 0;
 }
 
 } // namespace
 
-struct ControlState {
-    SafetyState safetyState = SafetyState::UNINITIALIZED;
-    float filteredVelocityRadPerSec = 0.0f;
-    float previousAngleRad = 0.0f;
-    float commandedCurrentA = 0.0f;
-    float commandedVoltageV = 0.0f;
-};
-
 class ArmAssistController {
 public:
-    ArmAssistController() {
-        cfg_ = ControlConfig{};
-        state_ = ControlState{};
-    }
-
     void setConfig(const ControlConfig &cfg) {
         cfg_ = cfg;
-        if (!configReady(cfg_)) {
-            state_.safetyState = SafetyState::UNINITIALIZED;
-            state_.commandedCurrentA = 0.0f;
-            state_.commandedVoltageV = 0.0f;
-            return;
-        }
-        if (cfg_.maxCurrentA <= 0.0f) {
-            cfg_.maxCurrentA = cfg_.continuousCurrentLimitA;
-        }
-        if (cfg_.commandVoltagePerAmp <= 0.0f) {
-            cfg_.commandVoltagePerAmp = 1.0f;
-            cfg_.commandVoltageOffset = 0.0f;
-        }
-        state_.safetyState = SafetyState::STANDBY;
+        configured_ = configReady(cfg_);
+        reset();
     }
 
-    const ControlConfig &config() const {
-        return cfg_;
-    }
-
-    SafetyState safetyState() const {
-        return state_.safetyState;
-    }
+    const ControlConfig &config() const { return cfg_; }
+    bool configured() const { return configured_; }
+    SafetyState safetyState() const { return safetyState_; }
+    EstopReason estopReason() const { return estopReason_; }
 
     void reset() {
-        state_.safetyState = SafetyState::UNINITIALIZED;
-        state_.filteredVelocityRadPerSec = 0.0f;
-        state_.previousAngleRad = 0.0f;
-        state_.commandedCurrentA = 0.0f;
-        state_.commandedVoltageV = 0.0f;
+        safetyState_ = configured_ ? SafetyState::STANDBY : SafetyState::UNINITIALIZED;
+        estopReason_ = EstopReason::None;
+        hasLastSetpoint_ = false;
+        lastSetpointRad_ = 0.0f;
+        overcurrentCount_ = 0;
     }
 
-    float updateLegacy(float velocityDegPerSec,
-                       float accelerationDegPerSec2,
-                       float motorCurrentA,
-                       float dtSec) {
-        if (!isValidFloat(velocityDegPerSec) || !isValidFloat(accelerationDegPerSec2) ||
-            !isValidFloat(motorCurrentA) || !isValidFloat(dtSec) || dtSec <= 0.0f) {
-            return 0.0f;
-        }
-
-        if (!configReady(cfg_)) {
-            return 0.0f;
-        }
-
-        // Legacy API is intentionally kept for compatibility. It is not used for
-        // the PDF position controller while calibration values remain zero.
-        (void)accelerationDegPerSec2;
-        (void)motorCurrentA;
-        (void)velocityDegPerSec;
-        return state_.commandedVoltageV;
-    }
-
-    float updateSignedLegacy(float velocityDegPerSec,
-                             float accelerationDegPerSec2,
-                             float motorCurrentA,
-                             float dtSec,
-                             bool forwardDirection) {
-        const float signedAssist = updateLegacy(velocityDegPerSec,
-                                              accelerationDegPerSec2,
-                                              motorCurrentA,
-                                              dtSec);
-        return forwardDirection ? signedAssist : -signedAssist;
-    }
-
-    float updatePosition(float currentAngleRad,
-                         float targetAngleRad,
-                         float angularVelocityRadPerSec,
-                         float dtSec) {
-        if (!isValidFloat(currentAngleRad) || !isValidFloat(targetAngleRad) ||
-            !isValidFloat(angularVelocityRadPerSec) || !isValidFloat(dtSec) || dtSec <= 0.0f) {
-            state_.safetyState = SafetyState::DEGRADED;
-            state_.commandedCurrentA = 0.0f;
-            state_.commandedVoltageV = 0.0f;
-            return 0.0f;
-        }
-
-        if (!configReady(cfg_)) {
-            state_.safetyState = SafetyState::UNINITIALIZED;
-            state_.commandedCurrentA = 0.0f;
-            state_.commandedVoltageV = 0.0f;
-            return 0.0f;
-        }
-
-        const float positionErrorRad = targetAngleRad - currentAngleRad;
-        state_.filteredVelocityRadPerSec =
-            cfg_.velocityFilterAlpha * angularVelocityRadPerSec +
-            (1.0f - cfg_.velocityFilterAlpha) * state_.filteredVelocityRadPerSec;
-
-        const float gravityTorqueNm =
-            cfg_.massKg * GRAVITY_M_PER_S2 * cfg_.centerOfMassM * sinf(currentAngleRad);
-        const float requiredTorqueNm =
-            cfg_.kpNmPerRad * positionErrorRad -
-            cfg_.kdNmSPerRad * state_.filteredVelocityRadPerSec +
-            gravityTorqueNm;
-
+    float update(const ControlInput &in, ControlOutput &out) {
+        out = ControlOutput{};
         const float jointTorquePerAmp =
             cfg_.torqueConstantNmPerA * cfg_.gearRatio * cfg_.transmissionEfficiency;
-        const float commandedTorqueNm = cfg_.assistance * requiredTorqueNm;
-        const float limitedTorqueNm = clampf(commandedTorqueNm,
-                                           -cfg_.emergencyTorqueNm,
-                                           cfg_.emergencyTorqueNm);
+        out.measuredTorqueNm = in.measuredCurrentA * jointTorquePerAmp;
 
-        const float currentLimitA = cfg_.maxCurrentA > 0.0f ? cfg_.maxCurrentA : cfg_.continuousCurrentLimitA;
-        const float commandedCurrentA = clampf(limitedTorqueNm / jointTorquePerAmp,
-                                              -currentLimitA,
-                                              currentLimitA);
-
-        if (fabsf(state_.filteredVelocityRadPerSec) > cfg_.maxVelocityRadPerSec) {
-            state_.safetyState = SafetyState::ESTOP_FAULT;
-            state_.commandedCurrentA = 0.0f;
-            state_.commandedVoltageV = 0.0f;
+        if (!configured_) {
+            safetyState_ = SafetyState::UNINITIALIZED;
+            return 0.0f;
+        }
+        if (safetyState_ == SafetyState::ESTOP_FAULT) {
             return 0.0f;
         }
 
-        if (fabsf(limitedTorqueNm) > cfg_.emergencyTorqueNm) {
-            state_.safetyState = SafetyState::ESTOP_FAULT;
-            state_.commandedCurrentA = 0.0f;
-            state_.commandedVoltageV = 0.0f;
-            return 0.0f;
+        if (!isfinite(in.angleRad) || !isfinite(in.setpointRad) || !isfinite(in.targetRad) ||
+            !isfinite(in.velocityRadPerSec) || !isfinite(in.measuredCurrentA) ||
+            !isfinite(in.dtSec) || in.dtSec <= 0.0f) {
+            return trip(EstopReason::InvalidInput);
         }
 
-        state_.commandedCurrentA = commandedCurrentA;
-        state_.commandedVoltageV = cfg_.commandVoltageOffset +
-                                 state_.commandedCurrentA * cfg_.commandVoltagePerAmp;
-        state_.safetyState = SafetyState::ACTIVE;
-        return state_.commandedVoltageV;
+        const float vel = in.velocityRadPerSec;
+        if (fabsf(vel) > cfg_.hardVelocityLimitRadPerSec) {
+            return trip(EstopReason::Overspeed);
+        }
+
+        if (fabsf(in.measuredCurrentA) > cfg_.overcurrentTripA) {
+            if (++overcurrentCount_ >= cfg_.overcurrentTicks) {
+                return trip(EstopReason::Overcurrent);
+            }
+        } else {
+            overcurrentCount_ = 0;
+        }
+
+        // Gravity torque on the joint in the +angle direction is m*g*L*sin(angle)
+        // (0 = up), so compensation is the negative of that.
+        const float gravityCompNm =
+            -cfg_.massKg * GRAVITY_M_PER_S2 * cfg_.centerOfMassM * sinf(in.angleRad);
+
+        float torqueNm = 0.0f;
+        if (in.mode == AssistMode::Assist) {
+            const float assistance = clampf(in.assistance, 0.0f, 1.0f);
+            if (!hasLastSetpoint_) {
+                lastSetpointRad_ = in.setpointRad;
+                hasLastSetpoint_ = true;
+            }
+            const float setpointVel = (in.setpointRad - lastSetpointRad_) / in.dtSec;
+            lastSetpointRad_ = in.setpointRad;
+
+            float trackingNm = assistance * (cfg_.kpNmPerRad * (in.setpointRad - in.angleRad) +
+                                             cfg_.kdNmSPerRad * (setpointVel - vel));
+            // Assist only toward the final target, never away from it.
+            const float targetDir = signf(in.targetRad - in.angleRad);
+            if (trackingNm * targetDir < 0.0f) {
+                trackingNm = 0.0f;
+            }
+            torqueNm = trackingNm + assistance * gravityCompNm;
+        } else {
+            torqueNm = -cfg_.resistDampingNmSPerRad * vel + gravityCompNm;
+        }
+
+        const float excessVel = fabsf(vel) - cfg_.softVelocityLimitRadPerSec;
+        if (excessVel > 0.0f) {
+            torqueNm -= cfg_.overspeedDampingNmSPerRad * excessVel * signf(vel);
+        }
+
+        if ((in.atForwardLimit && torqueNm > 0.0f) || (in.atBackwardLimit && torqueNm < 0.0f)) {
+            torqueNm = 0.0f;
+        }
+
+        torqueNm = clampf(torqueNm, -cfg_.maxTorqueNm, cfg_.maxTorqueNm);
+
+        const float currentLimitA = fminf(cfg_.maxCurrentA * clampf(in.currentLimitScale, 0.0f, 1.0f),
+                                          cfg_.esconFullScaleCurrentA);
+        const float currentA = clampf(torqueNm / jointTorquePerAmp, -currentLimitA, currentLimitA);
+
+        out.commandedCurrentA = currentA;
+        out.commandedTorqueNm = currentA * jointTorquePerAmp;
+        safetyState_ = SafetyState::ACTIVE;
+        return currentA;
     }
 
 private:
-    ControlConfig cfg_;
-    ControlState state_;
+    float trip(EstopReason reason) {
+        safetyState_ = SafetyState::ESTOP_FAULT;
+        estopReason_ = reason;
+        return 0.0f;
+    }
+
+    ControlConfig cfg_{};
+    bool configured_ = false;
+    SafetyState safetyState_ = SafetyState::UNINITIALIZED;
+    EstopReason estopReason_ = EstopReason::None;
+    bool hasLastSetpoint_ = false;
+    float lastSetpointRad_ = 0.0f;
+    int overcurrentCount_ = 0;
 };
 
 } // namespace NeuroExoControl
 
 static NeuroExoControl::ArmAssistController gArmAssistController;
 
-float ControlAlgorithm_UpdateAssist(float velocityDegPerSec,
-                                    float accelerationDegPerSec2,
-                                    float motorCurrentA,
-                                    float dtSec) {
-    return gArmAssistController.updateLegacy(velocityDegPerSec,
-                                           accelerationDegPerSec2,
-                                           motorCurrentA,
-                                           dtSec);
-}
-
-float ControlAlgorithm_UpdateSignedAssist(float velocityDegPerSec,
-                                          float accelerationDegPerSec2,
-                                          float motorCurrentA,
-                                          float dtSec,
-                                          bool forwardDirection) {
-    return gArmAssistController.updateSignedLegacy(velocityDegPerSec,
-                                                 accelerationDegPerSec2,
-                                                 motorCurrentA,
-                                                 dtSec,
-                                                 forwardDirection);
-}
-
-float ControlAlgorithm_UpdatePositionAssist(float currentAngleRad,
-                                          float targetAngleRad,
-                                          float angularVelocityRadPerSec,
-                                          float dtSec) {
-    return gArmAssistController.updatePosition(currentAngleRad,
-                                             targetAngleRad,
-                                             angularVelocityRadPerSec,
-                                             dtSec);
+float ControlAlgorithm_Update(const NeuroExoControl::ControlInput &in,
+                              NeuroExoControl::ControlOutput &out) {
+    return gArmAssistController.update(in, out);
 }
 
 void ControlAlgorithm_Reset() {
@@ -244,6 +211,14 @@ const NeuroExoControl::ControlConfig &ControlAlgorithm_GetConfig() {
     return gArmAssistController.config();
 }
 
+bool ControlAlgorithm_IsConfigured() {
+    return gArmAssistController.configured();
+}
+
 NeuroExoControl::SafetyState ControlAlgorithm_GetSafetyState() {
     return gArmAssistController.safetyState();
+}
+
+NeuroExoControl::EstopReason ControlAlgorithm_GetEstopReason() {
+    return gArmAssistController.estopReason();
 }

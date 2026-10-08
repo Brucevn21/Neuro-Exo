@@ -76,6 +76,7 @@ Status bits:
 | 0 | `MotionActive` | A trajectory is currently active |
 | 1 | `CommandTimeout` | No valid control command arrived within 250 ms |
 | 2 | `InvalidCommand` | The most recent received I2C command was invalid |
+| 3 | `SafetyFault` | Controller e-stop latched (over-speed, overcurrent, invalid sensor data, or tracking error). Motion commands are ignored until no command has arrived for 250 ms |
 
 Example: angle `45`, current `1200 mA`, motion active:
 

@@ -47,7 +47,6 @@ float encRange[2] = {180, -180};
 float encOffset = 65.21f;
 int nbits = 16;
 
-PID_t jointPID;
 volatile float interpolateBegin = 0.0f;
 volatile float interpolateEnd = 45.0f;
 volatile float setPointInterpolated = 0.0f;
@@ -59,12 +58,11 @@ float Vc = 0.0f;
 IntervalTimer motorControlTimer;
 
 volatile bool motorMotionActive = false;
-float DerivativeFilterAlpha = 0.2f;
 unsigned long lastDebugTime = 0;
 const unsigned long DEBUG_INTERVAL_MS = 500;
 
 // Speed setting controls both trajectory duration (interpCycles) and the
-// maximum effort (voltage) the PID/assist output is allowed to command.
+// fraction of the controller's max current that may be commanded.
 int interpCyclesForSpeed(NeuroExoProtocol::Speed speed) {
     switch (speed) {
         case NeuroExoProtocol::Speed::Slow:   return 60000;
@@ -90,11 +88,54 @@ volatile float measuredMotorCurrentA = 0.0f;
 float lastEncDegForDeriv = 0.0f;
 float lastVelDegPerSec = 0.0f;
 unsigned long lastKinematicMicros = 0;
+// Differentiate at a fixed rate (not every loop pass) so one encoder count
+// (~0.088 deg) doesn't become a huge velocity spike, then low-pass with an
+// EMA. At 2 ms: alpha 0.2 ~ 20 Hz cutoff, alpha 0.1 ~ 9 Hz cutoff.
+const unsigned long KINEMATIC_SAMPLE_US = 2000;
+const float VELOCITY_FILTER_ALPHA = 0.2f;
+const float ACCEL_FILTER_ALPHA = 0.1f;
 unsigned long lastStreamTime = 0;
 const unsigned long STREAM_INTERVAL_MS = 20; // 50 Hz feed for the live visualizer
 
-const float CURRENT_SENSOR_ZERO_V = 0.0f;
-const float CURRENT_SENSOR_A_PER_V = 1.0f;
+// ESCON analog out 1: 0 V = -7 A, 1.65 V = 0 A, 3.3 V = +7 A.
+const float CURRENT_SENSOR_ZERO_V = 1.65f;
+const float CURRENT_SENSOR_A_PER_V = 7.0f / 1.65f;
+
+// ---- Controller tuning (see ControlAlgorithm.cpp) ----
+// Conservative starting values from the control-algorithm PDF; tune on the
+// bench with no one attached first.
+const float CONTROL_DT_S = 0.002f;            // motorControlTimer period
+const float RAD_PER_DEG = 0.01745329f;
+// ESCON Studio current set-value at 90 % PWM duty. MUST be set to match the
+// ESCON configuration; while 0 the controller stays off and the motor is never enabled.
+const float ESCON_FULL_SCALE_CURRENT_A = 0.0f;
+const float ASSISTIVE_ASSISTANCE = 0.7f;      // Assistive mode: robot gives 70 % of required torque
+const float NEUTRAL_ASSISTANCE = 1.0f;        // Neutral mode: robot does all the work (passive motion)
+const float NEUTRAL_MAX_TRACKING_ERROR_DEG = 10.0f;  // Neutral only; patient-driven modes lag by design
+
+NeuroExoControl::ControlConfig makeControlConfig() {
+    NeuroExoControl::ControlConfig cfg;
+    cfg.esconFullScaleCurrentA = ESCON_FULL_SCALE_CURRENT_A;
+    cfg.kpNmPerRad = 10.0f;
+    cfg.kdNmSPerRad = 1.0f;
+    cfg.massKg = 0.0f;                        // Set limb + brace mass to enable gravity compensation
+    cfg.centerOfMassM = 0.0f;
+    cfg.resistDampingNmSPerRad = 2.0f;
+    cfg.softVelocityLimitRadPerSec = 90.0f * RAD_PER_DEG;
+    cfg.overspeedDampingNmSPerRad = 3.0f;
+    cfg.hardVelocityLimitRadPerSec = 300.0f * RAD_PER_DEG;
+    cfg.maxTorqueNm = 10.0f;
+    cfg.maxCurrentA = 2.0f;                   // ~11 N*m at the joint
+    cfg.overcurrentTripA = 3.0f;
+    cfg.overcurrentTicks = 25;                // 50 ms at 2 ms per tick
+    return cfg;
+}
+
+// Set when the controller or the Neutral tracking check faults. Motion
+// commands are ignored until the command stream goes quiet (timeout).
+volatile bool safetyEstopLatched = false;
+volatile NeuroExoControl::EstopReason lastEstopReason = NeuroExoControl::EstopReason::None;
+volatile float commandedCurrentA = 0.0f;
 
 void receiveEvent(int howMany);
 void requestEvent();
@@ -120,51 +161,55 @@ void motorControlISR() {
         interpInitialized = false;
     }
 
-    bool safetyStop = false;
-    float positionError = abs(setPointInterpolated - encDeg);
-    if (positionError > 10.0f) {
-        safetyStop = true;
-    }
-
-    if (safetyStop || !motorMotionActive) {
+    if (!motorMotionActive) {
         Vc = 0.0f;
+        commandedCurrentA = 0.0f;
         motor.disable();
-        jointPID.integral = 0.0f;
-        jointPID.lastError = 0.0f;
-        jointPID.filteredDerivative = 0.0f;
         ControlAlgorithm_Reset();
-    } else {
-        float motorControl = motor.computePID(setPointInterpolated, encDeg, jointPID);
-
-        bool forwardDirection = (motorControl >= 0.0f);
-        float assistControl = ControlAlgorithm_UpdateSignedAssist(
-            measuredVelocityDegPerSec,
-            measuredAccelDegPerSec2,
-            measuredMotorCurrentA,
-            jointPID.dt,
-            forwardDirection
-        );
-
-        float combinedControl = motorControl + assistControl;
-
-        // Mode dictates physical rotation direction: Assistive always drives
-        // forward, Resistive always drives backward (counterclockwise).
-        // Neutral keeps the PID's natural error-correcting direction.
-        NeuroExoProtocol::Mode mode = lastCommandedMode;
-        float directedControl = combinedControl;
-        if (mode == NeuroExoProtocol::Mode::Assistive) {
-            directedControl = fabsf(combinedControl);
-        } else if (mode == NeuroExoProtocol::Mode::Resistive) {
-            directedControl = -fabsf(combinedControl);
-        }
-
-        const float maxEffort = MOTOR_VCC_V * maxEffortScaleForSpeed(lastCommandedSpeed);
-        directedControl = constrain(directedControl, -maxEffort, maxEffort);
-
-        motor.enable();
-        Vc = directedControl;
-        motor.rotate(Vc, direction);
+        return;
     }
+
+    const NeuroExoProtocol::Mode mode = lastCommandedMode;
+    bool trackingFault = mode == NeuroExoProtocol::Mode::Neutral &&
+                         fabsf(setPointInterpolated - encDeg) > NEUTRAL_MAX_TRACKING_ERROR_DEG;
+
+    NeuroExoControl::ControlInput in;
+    in.angleRad = encDeg * RAD_PER_DEG;
+    in.setpointRad = setPointInterpolated * RAD_PER_DEG;
+    in.targetRad = interpolateEnd * RAD_PER_DEG;
+    in.velocityRadPerSec = measuredVelocityDegPerSec * RAD_PER_DEG;
+    in.measuredCurrentA = measuredMotorCurrentA;
+    in.dtSec = CONTROL_DT_S;
+    in.mode = (mode == NeuroExoProtocol::Mode::Resistive) ? NeuroExoControl::AssistMode::Resist
+                                                          : NeuroExoControl::AssistMode::Assist;
+    in.assistance = (mode == NeuroExoProtocol::Mode::Assistive) ? ASSISTIVE_ASSISTANCE : NEUTRAL_ASSISTANCE;
+    in.currentLimitScale = maxEffortScaleForSpeed(lastCommandedSpeed);
+    in.atForwardLimit = encDeg >= motorLimit.forwardLimit;
+    in.atBackwardLimit = encDeg <= motorLimit.backwardLimit;
+
+    NeuroExoControl::ControlOutput out;
+    const float currentA = ControlAlgorithm_Update(in, out);
+    const NeuroExoControl::SafetyState state = ControlAlgorithm_GetSafetyState();
+
+    if (trackingFault || state != NeuroExoControl::SafetyState::ACTIVE) {
+        if (trackingFault || state == NeuroExoControl::SafetyState::ESTOP_FAULT) {
+            safetyEstopLatched = true;
+            lastEstopReason = ControlAlgorithm_GetEstopReason();
+        }
+        Vc = 0.0f;
+        commandedCurrentA = 0.0f;
+        motor.disable();
+        motorMotionActive = false;
+        interpInitialized = false;
+        return;
+    }
+
+    // ESCON in current mode: |current| maps onto the 10-90 % PWM window via
+    // the driver's 0..MOTOR_VCC_V input range; sign selects the DIR pin.
+    commandedCurrentA = currentA;
+    Vc = (currentA / ESCON_FULL_SCALE_CURRENT_A) * MOTOR_VCC_V;
+    motor.enable();
+    motor.rotate(Vc, direction);
 }
 
 void receiveEvent(int howMany) {
@@ -220,6 +265,9 @@ void processI2CCommand() {
     invalidCommand = false;
     lastValidCommandTime = millis();
     commandTimedOut = false;
+    if (safetyEstopLatched) {
+        return;
+    }
     lastCommandedMode = packet.mode;
     lastCommandedSpeed = packet.speed;
     motorMotionActive = true;
@@ -238,6 +286,9 @@ void updateTelemetryFrame() {
     }
     if (commandTimedOut) {
         packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::CommandTimeout);
+    }
+    if (safetyEstopLatched) {
+        packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::SafetyFault);
     }
     if (invalidCommand) {
         packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::InvalidCommand);
@@ -277,7 +328,7 @@ void setup() {
 
     motor.init(motorWiring, motorLimit);
 
-    jointPID = {0.2f, 0.0f, 0.0002f, 0.002f, 0.0f, 0.0f, 0.0f, 0.3f, DerivativeFilterAlpha};
+    ControlAlgorithm_SetConfig(makeControlConfig());
 
     lastKinematicMicros = micros();
     lastEncDegForDeriv = encDeg;
@@ -296,12 +347,17 @@ void setup() {
     Serial.println("NeuroExoFirmware - Main Controller");
     Serial.println("========================================");
     Serial.println("I2C Slave Ready. Waiting for joint packets...");
-    Serial.print("PID Gains - Kp: ");
-    Serial.print(jointPID.Kp);
-    Serial.print(", Kd: ");
-    Serial.print(jointPID.Kd);
-    Serial.print(", Deadband: ");
-    Serial.println(jointPID.deadband);
+    if (!ControlAlgorithm_IsConfigured()) {
+        Serial.println("WARNING: controller config incomplete (set ESCON_FULL_SCALE_CURRENT_A). Motor will stay disabled.");
+    }
+    const NeuroExoControl::ControlConfig &cfg = ControlAlgorithm_GetConfig();
+    Serial.print("Controller - Kp: ");
+    Serial.print(cfg.kpNmPerRad);
+    Serial.print(" N*m/rad, Kd: ");
+    Serial.print(cfg.kdNmSPerRad);
+    Serial.print(" N*m*s/rad, max current: ");
+    Serial.print(cfg.maxCurrentA);
+    Serial.println(" A");
     Serial.println();
 }
 
@@ -312,6 +368,7 @@ void loop() {
     if (currentTime - lastValidCommandTime > NeuroExoProtocol::COMMAND_TIMEOUT_MS) {
         commandTimedOut = true;
         motorMotionActive = false;
+        safetyEstopLatched = false;
     }
 
     encBinary = myAS5045.read();
@@ -319,10 +376,12 @@ void loop() {
     encDeg = EncCalib(encRange, encOffset, encRaw);
 
     unsigned long nowMicros = micros();
-    float dtSec = (nowMicros - lastKinematicMicros) * 1.0e-6f;
-    if (dtSec > 0.0f) {
-        float vel = (encDeg - lastEncDegForDeriv) / dtSec;
-        float acc = (vel - lastVelDegPerSec) / dtSec;
+    if (nowMicros - lastKinematicMicros >= KINEMATIC_SAMPLE_US) {
+        float dtSec = (nowMicros - lastKinematicMicros) * 1.0e-6f;
+        float rawVel = (encDeg - lastEncDegForDeriv) / dtSec;
+        float vel = VELOCITY_FILTER_ALPHA * rawVel + (1.0f - VELOCITY_FILTER_ALPHA) * lastVelDegPerSec;
+        float rawAcc = (vel - lastVelDegPerSec) / dtSec;
+        float acc = ACCEL_FILTER_ALPHA * rawAcc + (1.0f - ACCEL_FILTER_ALPHA) * measuredAccelDegPerSec2;
 
         measuredVelocityDegPerSec = vel;
         measuredAccelDegPerSec2 = acc;
@@ -351,7 +410,13 @@ void loop() {
         Serial.print(',');
         Serial.print(measuredVelocityDegPerSec, 2);
         Serial.print(',');
-        Serial.println(motorMotionActive ? 1 : 0);
+        Serial.print(motorMotionActive ? 1 : 0);
+        Serial.print(',');
+        Serial.print(measuredAccelDegPerSec2, 2);
+        Serial.print(',');
+        Serial.print(measuredMotorCurrentA, 4);
+        Serial.print(',');
+        Serial.println(currentTime);
     }
 
     if (currentTime - lastDebugTime >= DEBUG_INTERVAL_MS) {
@@ -362,6 +427,14 @@ void loop() {
         Serial.print(encDeg, 2);
         Serial.print(" deg | Current Draw: ");
         Serial.print(measuredMotorCurrentA * 1000.0f, 2);
-        Serial.println(" mA");
+        Serial.print(" mA | Cmd: ");
+        Serial.print(commandedCurrentA * 1000.0f, 2);
+        Serial.print(" mA");
+        if (safetyEstopLatched) {
+            Serial.print(" | E-STOP reason ");
+            Serial.print((int)lastEstopReason);
+            Serial.print(" (0=tracking, 1=invalid input, 2=overspeed, 3=overcurrent)");
+        }
+        Serial.println();
     }
 }

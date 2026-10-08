@@ -21,7 +21,8 @@ enum class TelemetryStatus : uint8_t {
     None = 0,
     MotionActive = 1 << 0,
     CommandTimeout = 1 << 1,
-    InvalidCommand = 1 << 2
+    InvalidCommand = 1 << 2,
+    SafetyFault = 1 << 3
 };
 
 enum class Mode : uint8_t {

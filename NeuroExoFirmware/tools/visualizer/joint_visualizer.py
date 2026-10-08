@@ -2,10 +2,10 @@
 """
 Live serial visualizer for the NeuroExo joint.
 
-Reads the "JOINT,<enc>,<setpoint>,<target>,<Vc>,<vel>,<active>" CSV lines
-streamed by src/main.cpp (see STREAM_INTERVAL_MS) over a serial port and
-renders the joint as a rotating single-link arm, plus live plots of angle
-and velocity.
+Reads the "JOINT,<enc>,<setpoint>,<target>,<Vc>,<vel>,<active>,<acc>,<currentA>,<ms>"
+CSV lines streamed by src/main.cpp (see STREAM_INTERVAL_MS) over a serial port
+and renders the joint as a rotating single-link arm, plus live plots of angle
+and velocity. Active trials are logged to CSV (see trial_logger.py).
 
 Usage:
     python joint_visualizer.py --port /dev/ttyACM0 --baud 115200
@@ -15,6 +15,7 @@ On Windows, --port would look like "COM5".
 
 import argparse
 import collections
+import os
 import sys
 import time
 
@@ -23,10 +24,13 @@ import matplotlib.animation as animation
 import numpy as np
 import serial
 
+from trial_logger import TrialCsvLogger
+
 # Mechanical limits from main.cpp motorLimit (forwardLimit / backwardLimit).
 DEFAULT_MIN_DEG = -150.0
 DEFAULT_MAX_DEG = 80.0
 HISTORY_SECONDS = 10.0
+DEFAULT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry_data")
 
 
 def parse_args():
@@ -36,54 +40,100 @@ def parse_args():
     parser.add_argument("--min-deg", type=float, default=DEFAULT_MIN_DEG, help="Joint minimum angle (deg)")
     parser.add_argument("--max-deg", type=float, default=DEFAULT_MAX_DEG, help="Joint maximum angle (deg)")
     parser.add_argument("--link-length", type=float, default=1.0, help="Visual link length (arbitrary units)")
+    parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help="Directory for trial_run_N.csv files")
+    parser.add_argument("--keep-trials", type=int, default=5, help="Number of completed trials to keep")
+    parser.add_argument("--idle-gap-ms", type=int, default=300,
+                        help="Inactive time (ms) that ends a trial; shorter gaps are treated as one trial")
+    parser.add_argument("--no-log", action="store_true", help="Disable trial CSV logging")
     return parser.parse_args()
 
 
 class JointDataStream:
     """Reads and parses JOINT,... lines from the serial port without blocking the UI."""
 
-    def __init__(self, port, baud):
+    def __init__(self, port, baud, logger=None):
         self.ser = serial.Serial(port, baud, timeout=0.05)
+        self.logger = logger
+        self.legacy_stream = False
         self.encoder_deg = 0.0
         self.setpoint_deg = 0.0
         self.target_deg = 0.0
         self.voltage = 0.0
         self.velocity_deg_s = 0.0
         self.motion_active = False
+        self.accel_deg_s2 = 0.0
+        self.current_a = 0.0
         self.last_update = None
 
     def poll(self):
-        """Read all available lines and update state with the most recent valid sample."""
+        """Read all available lines, log each one, and keep the most recent valid sample."""
         updated = False
         while self.ser.in_waiting:
             raw = self.ser.readline().decode("utf-8", errors="ignore").strip()
             if not raw.startswith("JOINT,"):
                 continue
             fields = raw.split(",")
-            if len(fields) != 7:
+            # 7 fields = older firmware without accel/current/timestamp (display only, no logging).
+            if len(fields) not in (7, 10):
                 continue
             try:
-                self.encoder_deg = float(fields[1])
-                self.setpoint_deg = float(fields[2])
-                self.target_deg = float(fields[3])
-                self.voltage = float(fields[4])
-                self.velocity_deg_s = float(fields[5])
-                self.motion_active = fields[6] == "1"
+                encoder_deg = float(fields[1])
+                setpoint_deg = float(fields[2])
+                target_deg = float(fields[3])
+                voltage = float(fields[4])
+                velocity = float(fields[5])
+                motion_active = fields[6] == "1"
+                if len(fields) == 10:
+                    accel = float(fields[7])
+                    current_a = float(fields[8])
+                    device_ms = int(fields[9])
             except ValueError:
                 continue
+            self.encoder_deg = encoder_deg
+            self.setpoint_deg = setpoint_deg
+            self.target_deg = target_deg
+            self.voltage = voltage
+            self.velocity_deg_s = velocity
+            self.motion_active = motion_active
+            self.legacy_stream = len(fields) == 7
+            if not self.legacy_stream:
+                self.accel_deg_s2 = accel
+                self.current_a = current_a
+                if self.logger is not None:
+                    self._log_sample(device_ms)
             self.last_update = time.time()
             updated = True
         return updated
 
+    def _log_sample(self, device_ms):
+        try:
+            completed = self.logger.handle_sample(
+                device_ms, self.motion_active, self.current_a, self.velocity_deg_s,
+                self.accel_deg_s2, self.encoder_deg, self.target_deg, self.setpoint_deg,
+            )
+        except OSError as exc:
+            # e.g. trial_run_N.csv held open by Excel on Windows.
+            print(f"Trial logging error: {exc}", file=sys.stderr)
+            return
+        if completed:
+            print(f"Trial saved: {completed}")
+
     def close(self):
         self.ser.close()
+        if self.logger is not None:
+            self.logger.close()
 
 
 def main():
     args = parse_args()
 
+    logger = None
+    if not args.no_log:
+        logger = TrialCsvLogger(args.log_dir, keep=args.keep_trials, idle_gap_ms=args.idle_gap_ms)
+        print(f"Logging active trials to {os.path.abspath(args.log_dir)}")
+
     try:
-        stream = JointDataStream(args.port, args.baud)
+        stream = JointDataStream(args.port, args.baud, logger)
     except serial.SerialException as exc:
         print(f"Could not open serial port {args.port}: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -158,11 +208,21 @@ def main():
         status = "ACTIVE" if stream.motion_active else "IDLE"
         stale = stream.last_update is None or (time.time() - stream.last_update) > 1.0
         conn_status = "NO DATA" if stale else status
+        if logger is None:
+            log_status = "off"
+        elif stream.legacy_stream:
+            log_status = "off (old firmware)"
+        elif logger.trial_active:
+            log_status = f"REC ({logger.rows_in_trial} rows)"
+        else:
+            log_status = "waiting"
         angle_text.set_text(
             f"Encoder: {stream.encoder_deg:6.2f} deg\n"
             f"Target:  {stream.target_deg:6.2f} deg\n"
             f"Voltage: {stream.voltage:5.2f} V\n"
-            f"Status:  {conn_status}"
+            f"Current: {stream.current_a:6.3f} A\n"
+            f"Status:  {conn_status}\n"
+            f"Log:     {log_status}"
         )
 
         if time_hist:
