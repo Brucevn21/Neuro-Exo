@@ -1,5 +1,5 @@
 // Native tests exercise the exact core included by the Nano sketch.
-#include "../NanoBLEBenchmark/receiver_protocol.h"
+#include "../firmware/NanoBLEBenchmark/receiver_protocol.h"
 #include <sstream>
 // Independent serializer using the same default ostream operations as the
 // read-only reference file. Verifies Python formatting on identical doubles.

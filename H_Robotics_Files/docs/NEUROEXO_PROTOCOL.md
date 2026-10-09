@@ -56,7 +56,7 @@ The duration argument controls trial length, not the time to reach the target.
 From the repository root in WSL, Linux, or another Python environment:
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py protocol-demo --duration 0.16 --hex
+python3 H_Robotics_Files/python/read_outputs.py protocol-demo --duration 0.16 --hex
 ~~~
 
 This runs in **virtual time**, with simulated arm position and no Bleak
@@ -64,7 +64,7 @@ dependency. It exercises calibration, maximum, configuration, initial position,
 Start, four 40 ms position requests, and End. It does not measure performance.
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py protocol-demo \
+python3 H_Robotics_Files/python/read_outputs.py protocol-demo \
   --trials 20 --duration 2 --start 0 --target 60 --assistance 30 \
   --log protocol_trace_demo.jsonl
 ~~~
@@ -73,7 +73,7 @@ Every JSONL record includes raw hex and decoded fields. Existing log files are
 never overwritten. To decode a single captured 20-byte value:
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py protocol-decode \
+python3 H_Robotics_Files/python/read_outputs.py protocol-decode \
   "4e 01 03 00 03 00 01 00 60 ea 00 00 00 00 00 00 30 75 00 00"
 ~~~
 
@@ -82,7 +82,7 @@ position 0 degrees, and assistance velocity 30 degrees/second.
 
 ## Load the matching Nano receiver
 
-1. Open NanoNeuroExoProtocol/NanoNeuroExoProtocol.ino in Arduino IDE. Keep
+1. Open firmware/NanoNeuroExoProtocol/NanoNeuroExoProtocol.ino in Arduino IDE. Keep
    trial_protocol.h alongside it.
 2. Use Arduino Nano 33 BLE, the Arduino Mbed OS Nano Boards package, and the
    ArduinoBLE library (the project specifies version 1.3.7).
@@ -108,14 +108,14 @@ bluetoothctl show
 bluetoothctl power on
 python3 -m venv H_Robotics_Files/.venv
 source H_Robotics_Files/.venv/bin/activate
-python3 -m pip install -r H_Robotics_Files/requirements-ble.txt
-python3 H_Robotics_Files/read_outputs.py protocol-scan
+python3 -m pip install -r H_Robotics_Files/python/requirements-ble.txt
+python3 H_Robotics_Files/python/read_outputs.py protocol-scan
 ~~~
 
 Replace the example address with the address printed beside NanoNeuroExo:
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py protocol-run \
+python3 H_Robotics_Files/python/read_outputs.py protocol-run \
   --address AA:BB:CC:DD:EE:FF --trials 1 --duration 2 \
   --interval-ms 40 --start 0 --target 60 --assistance 30 \
   --max-position 90 --hex --log protocol_trace_live.jsonl
@@ -157,7 +157,7 @@ It uses the same trial protocol as Python. The displayed a/b/c integers follow
 the mapping below. It reports position in degrees and marks simulated replies.
 
 To integrate with the original application, link it to the neuroexo_ble CMake
-library (BleTrialClient.cpp, BluezGatt.cpp, GIO, and Threads). The full acquisition
+library (ble/BleTrialClient.cpp, ble/BluezGatt.cpp, GIO, and Threads). The full acquisition
 application still requires the missing IMU, channel, FIR filter, H-infinity,
 global-variable, calibration, and SVM implementations. The independent BLE
 executable is provided so communication can be tested before restoring those.

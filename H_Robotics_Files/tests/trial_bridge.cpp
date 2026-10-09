@@ -1,4 +1,4 @@
-#include "../NanoNeuroExoProtocol/trial_protocol.h"
+#include "../firmware/NanoNeuroExoProtocol/trial_protocol.h"
 static neuroexo::Simulator nano;
 extern "C" {
 void trial_reset() { nano.reset(); }

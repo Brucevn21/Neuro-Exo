@@ -4,7 +4,7 @@
 > not execute the C++ application or measure its filters/IMU/SVM.
 
 The **hardware-eeg** benchmark profile models the active EEG/EOG debug traffic
-in [Hardware_Interface.cpp](Hardware_Interface.cpp). That file is a read-only
+in [Hardware_Interface.cpp](../app/Hardware_Interface.cpp). That file is a read-only
 reference; this implementation does not edit, build, or run it.
 
 The purpose is to measure whether BLE between the BeagleBone Black Wireless
@@ -34,7 +34,7 @@ newline is one byte. The C++ amplifier's 27-byte SPI transaction is an internal
 input frame, not the outgoing Bluetooth message size.
 
 Synthetic values come from deterministic sine/cosine expressions in
-[hardware_traffic.py](hardware_traffic.py). Their amplitudes are illustrative.
+[hardware_traffic.py](../python/hardware_traffic.py). Their amplitudes are illustrative.
 They are not captured measurements, a physiological model, or the result of
 the original filters. Keeping the same sample sequence between runs makes
 message lengths and contents repeatable while comparing transport performance.
@@ -44,7 +44,7 @@ message lengths and contents repeatable while comparing transport performance.
 Run from the repository root:
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-preview --count 3
+python3 H_Robotics_Files/python/read_outputs.py ble-preview --count 3
 ~~~
 
 This requires no Bleak installation or Bluetooth adapter. It prints each
@@ -59,9 +59,9 @@ receiver now use benchmark protocol version 2; recompile/upload the receiver
 if an earlier version is installed.
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-scan
+python3 H_Robotics_Files/python/read_outputs.py ble-scan
 
-python3 H_Robotics_Files/read_outputs.py ble-benchmark \
+python3 H_Robotics_Files/python/read_outputs.py ble-benchmark \
   --address AA:BB:CC:DD:EE:FF \
   --profile hardware-eeg --pacing source-loop \
   --count 2500 --repeats 3 \
@@ -99,7 +99,7 @@ cannot establish maximum sustainable input rate.
 **Find the capacity boundary with a fixed-rate sweep**
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-benchmark \
+python3 H_Robotics_Files/python/read_outputs.py ble-benchmark \
   --address AA:BB:CC:DD:EE:FF \
   --profile hardware-eeg --pacing rate \
   --rates 50 100 150 200 250 300 \
@@ -124,7 +124,7 @@ The hardware-eeg profile always contains exactly eight values, so it rejects
 size/load sweeps, use the original pattern profile:
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-benchmark \
+python3 H_Robotics_Files/python/read_outputs.py ble-benchmark \
   --address AA:BB:CC:DD:EE:FF \
   --profile pattern --sizes 20 64 128 256 \
   --rates 50 100 250 --duration 10 --repeats 3 \

@@ -1,4 +1,4 @@
-#include "../Hardware_Interface.hpp"
+#include "../app/Hardware_Interface.hpp"
 #include <cassert>
 #include <cmath>
 #include <iostream>

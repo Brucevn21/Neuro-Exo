@@ -1,7 +1,7 @@
 # Current BLE arm interface
 
 The hardware interface now implements the NeuroExo trial protocol over BlueZ
-BLE GATT. See [NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md) for packet definitions,
+BLE GATT. See [NEUROEXO_PROTOCOL.md](docs/NEUROEXO_PROTOCOL.md) for packet definitions,
 the Python reader, the C++ build/run procedure, and the matching Nano receiver.
 The supplied receiver simulates position; the old angle/I2C sketch is incompatible.
 
@@ -10,10 +10,24 @@ TCP/RFCOMM version. Its old transport APIs and several listed defects have since
 been removed or corrected. Use the protocol guide for current behavior.
 
 For the BeagleBone-to-Nano 33 BLE packet load test, use the new
-[BLE benchmark procedure](BLE_BENCHMARK.md). It sends synthetic test data and
+[BLE benchmark procedure](docs/BLE_BENCHMARK.md). It sends synthetic test data and
 measures delivery independently of the EEG application described below.
-The [hardware-eeg profile](HARDWARE_INTERFACE_BENCHMARK.md) models the active
+The [hardware-eeg profile](docs/HARDWARE_INTERFACE_BENCHMARK.md) models the active
 C++ debug record format and pacing while leaving the reference C++ unchanged.
+
+## Folder layout
+
+| Folder | Contents |
+|---|---|
+| [app/](app/) | Original BBB acquisition application: main.cpp, Hardware_Interface.cpp/hpp. |
+| [ble/](ble/) | C++ BLE arm client library (neuroexo_ble): BleTrialClient, BluezGatt. |
+| [firmware/](firmware/) | Nano 33 BLE sketches: NanoNeuroExoProtocol (trial protocol), NanoBLEBenchmark (load test). |
+| [python/](python/) | read_outputs.py CLI and its modules; requirements-ble.txt. |
+| [examples/](examples/) | Standalone C++ BLE trial program. |
+| [tests/](tests/) | Python and C++ tests; hardware_stubs are test-only substitutes. |
+| [docs/](docs/) | Protocol, benchmark, and BeagleBone procedures; robot TCP protocol and manual. |
+
+CMakeLists.txt stays at this folder's root and builds ble/, examples/, and tests/.
 
 # Understanding H_Robotics_Files
 
@@ -36,11 +50,11 @@ existing code without changing its hardware behavior.
 
 | Original file | Purpose | What it outputs |
 |---|---|---|
-| [main.cpp](main.cpp) | Starts hardware, reads numeric commands, dispatches calibration/testing/debug modes, launches Python SVM training. | Console messages; calls to app-update functions; relayed training-script output. |
-| [Hardware_Interface.hpp](Hardware_Interface.hpp) | Declares the hardware class: buffers, gains, filters, IMU, sockets, and callable methods. | No output by itself. |
-| [Hardware_Interface.cpp](Hardware_Interface.cpp) | Implements amplifier setup, sample acquisition/conversion/filtering, internal sample delivery, and Bluetooth transport. | Console diagnostics; Bluetooth text records in debug mode; matrices passed inside the C++ process. |
-| [nsf-tcp-protocol.md](nsf-tcp-protocol.md) | Documents the robot firmware's TCP request/response protocol on port 11999. | A reference for interpreting four-field robot responses; it is not a server implementation. |
-| [manual.pdf](manual.pdf) | Six-page guide to rebless Wi-Fi setup, finding its IP, and selecting actuator orientation. | Instructions only. |
+| [main.cpp](app/main.cpp) | Starts hardware, reads numeric commands, dispatches calibration/testing/debug modes, launches Python SVM training. | Console messages; calls to app-update functions; relayed training-script output. |
+| [Hardware_Interface.hpp](app/Hardware_Interface.hpp) | Declares the hardware class: buffers, gains, filters, IMU, sockets, and callable methods. | No output by itself. |
+| [Hardware_Interface.cpp](app/Hardware_Interface.cpp) | Implements amplifier setup, sample acquisition/conversion/filtering, internal sample delivery, and Bluetooth transport. | Console diagnostics; Bluetooth text records in debug mode; matrices passed inside the C++ process. |
+| [nsf-tcp-protocol.md](docs/nsf-tcp-protocol.md) | Documents the robot firmware's TCP request/response protocol on port 11999. | A reference for interpreting four-field robot responses; it is not a server implementation. |
+| [manual.pdf](docs/manual.pdf) | Six-page guide to rebless Wi-Fi setup, finding its IP, and selecting actuator orientation. | Instructions only. |
 
 `read_outputs.py` and this README are new learning aids, not part of the original
 application. The original reader modes have no third-party Python dependencies;
@@ -301,7 +315,7 @@ setpoints. Stopping this reader does not stop a running motor.
    complete telemetry records.
 
 A syntax-only attempt, `g++ -std=c++17 -fsyntax-only
-H_Robotics_Files/main.cpp`, stops immediately at the missing `imu.hpp`. It does
+H_Robotics_Files/app/main.cpp`, stops immediately at the missing `imu.hpp`. It does
 not establish the rest of the program's build correctness. The hardware
 application has not been executed.
 
@@ -309,7 +323,7 @@ application has not been executed.
 
 For device-by-device setup, pairing, start/stop commands, expected output, and
 troubleshooting, follow the
-[BeagleBone terminal-reader procedure](BEAGLEBONE_READER_PROCEDURE.md).
+[BeagleBone terminal-reader procedure](docs/BEAGLEBONE_READER_PROCEDURE.md).
 
 Run these commands from the repository root. On Windows, use `python` or `py -3`
 in place of `python3` if that is how Python is installed.
@@ -317,7 +331,7 @@ in place of `python3` if that is how Python is installed.
 Start with the hardware-free demo:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py demo
+python3 H_Robotics_Files/python/read_outputs.py demo
 ```
 
 It prints labeled examples for logs, eight-channel EEG/EOG, full-data CSV, robot
@@ -328,14 +342,14 @@ as logs; malformed tagged records remain visible as `UNPARSED`.
 Read an existing text capture:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py stdin < capture.txt
+python3 H_Robotics_Files/python/read_outputs.py stdin < capture.txt
 ```
 
 Once the complete C++ application has been restored and built, a Linux shell
 pipeline can capture its console messages (the executable path is illustrative):
 
 ```bash
-./main 2>&1 | python3 H_Robotics_Files/read_outputs.py stdin
+./main 2>&1 | python3 H_Robotics_Files/python/read_outputs.py stdin
 ```
 
 Here `2>&1` combines diagnostic stderr with stdout; `|` feeds that text to the
@@ -348,7 +362,7 @@ with later text. Flush and newline-terminate any new telemetry records.
 To inspect matching robot firmware directly, replace the example IP:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py tcp 192.168.1.50 --count 10
+python3 H_Robotics_Files/python/read_outputs.py tcp 192.168.1.50 --count 10
 ```
 
 This works independently of the broken C++ program. It defaults to port 11999,
@@ -361,7 +375,7 @@ protocol; this was not tested against a physical robot.
 To receive debug EEG/EOG on a Linux computer with a working Bluetooth adapter:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py bluetooth --channel 1
+python3 H_Robotics_Files/python/read_outputs.py bluetooth --channel 1
 ```
 
 The C++ program is the RFCOMM **client**, so the reader is the listening
@@ -390,7 +404,7 @@ and robot status together. They remain separate sources, without synchronized
 sample timestamps. Saving the displayed text is optional:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py demo > terminal_capture.txt
+python3 H_Robotics_Files/python/read_outputs.py demo > terminal_capture.txt
 ```
 
 **Making the currently internal outputs readable later**

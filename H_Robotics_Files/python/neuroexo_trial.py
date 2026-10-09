@@ -1,4 +1,4 @@
-"""Readable trial-protocol demo and BLE client. See NEUROEXO_PROTOCOL.md."""
+"""Readable trial-protocol demo and BLE client. See docs/NEUROEXO_PROTOCOL.md."""
 import argparse
 import asyncio
 import json

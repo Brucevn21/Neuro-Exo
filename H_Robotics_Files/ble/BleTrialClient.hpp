@@ -1,5 +1,5 @@
 #pragma once
-#include "NanoNeuroExoProtocol/trial_protocol.h"
+#include "../firmware/NanoNeuroExoProtocol/trial_protocol.h"
 #include <array>
 #include <chrono>
 #include <cstdint>

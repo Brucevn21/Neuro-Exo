@@ -14,7 +14,7 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "python"))
 import ble_benchmark as b
 import read_outputs
 from hardware_traffic import eeg_values, eeg_record, serialize_eeg

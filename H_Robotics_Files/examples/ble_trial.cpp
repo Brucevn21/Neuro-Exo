@@ -1,4 +1,4 @@
-#include "../BleTrialClient.hpp"
+#include "../ble/BleTrialClient.hpp"
 #include <cmath>
 #include <csignal>
 #include <iomanip>

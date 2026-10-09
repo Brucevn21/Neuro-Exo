@@ -1,6 +1,6 @@
 // Exercises the actual BlueZ D-Bus client against an isolated fake org.bluez.
 // No system Bluetooth adapter or external network is accessed.
-#include "../BleTrialClient.hpp"
+#include "../ble/BleTrialClient.hpp"
 #include <gio/gio.h>
 #include <atomic>
 #include <condition_variable>

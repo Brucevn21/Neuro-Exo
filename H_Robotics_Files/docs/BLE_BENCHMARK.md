@@ -20,7 +20,7 @@ transport/application and does not apply to this benchmark.
 
 **1. Load the receiver onto the Nano.**
 
-Open [NanoBLEBenchmark.ino](NanoBLEBenchmark/NanoBLEBenchmark.ino) in Arduino
+Open [NanoBLEBenchmark.ino](../firmware/NanoBLEBenchmark/NanoBLEBenchmark.ino) in Arduino
 IDE. Keep receiver_protocol.h in the same folder. Install the official
 Arduino Mbed OS Nano Boards package and ArduinoBLE library version 1.3.7.
 Select **Arduino Nano 33 BLE** and its USB port, then compile and upload.
@@ -31,8 +31,8 @@ Uploading replaces the application currently on the Nano.
 Alternatively, use the standalone PlatformIO project:
 
 ~~~bash
-pio run -d H_Robotics_Files/NanoBLEBenchmark
-pio run -d H_Robotics_Files/NanoBLEBenchmark -t upload
+pio run -d H_Robotics_Files/firmware/NanoBLEBenchmark
+pio run -d H_Robotics_Files/firmware/NanoBLEBenchmark -t upload
 ~~~
 
 Power the Nano. It advertises as **NanoBLEBench**. The sketch runs without
@@ -64,7 +64,7 @@ Install Bleak in a virtual environment:
 ~~~bash
 python3 -m venv H_Robotics_Files/.venv
 source H_Robotics_Files/.venv/bin/activate
-python3 -m pip install -r H_Robotics_Files/requirements-ble.txt
+python3 -m pip install -r H_Robotics_Files/python/requirements-ble.txt
 ~~~
 
 If venv is missing, install the OS's python3-venv package, then repeat setup.
@@ -76,7 +76,7 @@ controller cannot perform this test.
 **3. Find the Nano.**
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-scan
+python3 H_Robotics_Files/python/read_outputs.py ble-scan
 ~~~
 
 Copy the address beside NanoBLEBench and replace AA:BB:CC:DD:EE:FF in the
@@ -86,7 +86,7 @@ require separate pairing. Disconnect other BLE apps from the Nano.
 **4. Run a short connection check.**
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-benchmark \
+python3 H_Robotics_Files/python/read_outputs.py ble-benchmark \
   --address AA:BB:CC:DD:EE:FF \
   --sizes 20 --rates 10 --count 100 --repeats 1 \
   --output ble_benchmark_check.csv
@@ -99,7 +99,7 @@ The CSV filename must be new; existing files are never overwritten.
 **5. Sweep sizes and rates.**
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-benchmark \
+python3 H_Robotics_Files/python/read_outputs.py ble-benchmark \
   --address AA:BB:CC:DD:EE:FF \
   --sizes 20 64 128 256 \
   --rates 10 25 50 100 200 400 \
@@ -120,7 +120,7 @@ maximum; results can vary between runs and environments.
 For an unpaced saturation test, use rate 0 with an explicit count:
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-benchmark \
+python3 H_Robotics_Files/python/read_outputs.py ble-benchmark \
   --address AA:BB:CC:DD:EE:FF \
   --sizes 20 64 --rates 0 --count 2000 --repeats 3 \
   --output ble_benchmark_unpaced.csv
@@ -201,7 +201,7 @@ immediately. A setup error before any run can leave a header-only CSV.
 For example, if 100 packets/second at 64 bytes passes:
 
 ~~~bash
-python3 H_Robotics_Files/read_outputs.py ble-benchmark \
+python3 H_Robotics_Files/python/read_outputs.py ble-benchmark \
   --address AA:BB:CC:DD:EE:FF \
   --sizes 64 --rates 100 --duration 120 --repeats 3 \
   --run-timeout 180 --rate-tolerance 0.01 \
@@ -237,7 +237,7 @@ CRC32 covers run u32 + sequence u16 + payload length u16 + payload; its little-e
 appended before fragmentation. Sequences range from 0 to count-1; each run
 supports at most 65536 packets. An 8 KiB bitmap tracks unique completions.
 One packet is reassembled at a time with ordered fragments. Pages 0–5 match
-PAGE_FIELDS in [ble_benchmark.py](ble_benchmark.py). STOP freezes the counters.
+PAGE_FIELDS in [ble_benchmark.py](../python/ble_benchmark.py). STOP freezes the counters.
 
 Run the local tests from the repository root:
 

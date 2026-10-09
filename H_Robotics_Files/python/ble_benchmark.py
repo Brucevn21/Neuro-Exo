@@ -1,4 +1,4 @@
-"""BLE application-packet load test. See BLE_BENCHMARK.md for setup/protocol."""
+"""BLE application-packet load test. See docs/BLE_BENCHMARK.md for setup/protocol."""
 
 import argparse
 import asyncio
@@ -415,7 +415,7 @@ async def execute(args):
     try:
         from bleak import BleakClient, BleakScanner
     except ImportError as error:
-        raise RuntimeError("BLE modes need Bleak: python3 -m pip install -r H_Robotics_Files/requirements-ble.txt") from error
+        raise RuntimeError("BLE modes need Bleak: python3 -m pip install -r H_Robotics_Files/python/requirements-ble.txt") from error
     if args.mode == "ble-scan":
         found = await BleakScanner.discover(timeout=args.timeout, return_adv=True)
         matches = 0

@@ -4,7 +4,7 @@
 > Python/C++ run commands.
 
 This procedure receives the BeagleBone application's EEG/EOG messages with
-[`read_outputs.py`](read_outputs.py) and displays them in a terminal. It assumes
+[`read_outputs.py`](../python/read_outputs.py) and displays them in a terminal. It assumes
 the Classic Bluetooth transport implemented in this folder's C++ code.
 
 **What the reader displays**
@@ -55,7 +55,7 @@ and [Black Wireless specifications](https://www.beagleboard.org/boards/beaglebon
 Live acquisition requires the complete, working C++ application on the board,
 including its sensor hardware and required services. **The C++ files in this
 folder cannot currently build by themselves:** dependencies are missing and
-there are source errors. See the [project explanation](README.md). This guide
+there are source errors. See the [project explanation](../README.md). This guide
 cannot supply a build command or executable path for the missing application.
 The examples below use `./main` as a placeholder for its actual executable.
 
@@ -74,7 +74,7 @@ carries the EEG/EOG data to the receiver.
 Open a terminal in the `Neuro-Exo` repository root and run:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py demo
+python3 H_Robotics_Files/python/read_outputs.py demo
 ```
 
 Expect labeled sample lines. This checks Python and the display using synthetic
@@ -165,7 +165,7 @@ The supplied source leaves the address empty and never calls this setter.
 In the receiver terminal, from the repository root:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py bluetooth --channel 1
+python3 H_Robotics_Files/python/read_outputs.py bluetooth --channel 1
 ```
 
 Expected startup message:
@@ -180,13 +180,13 @@ address into the BeagleBone's sender configuration. If the receiver has
 multiple adapters, select one explicitly:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py bluetooth --bind AA:BB:CC:DD:EE:FF --channel 1
+python3 H_Robotics_Files/python/read_outputs.py bluetooth --bind AA:BB:CC:DD:EE:FF --channel 1
 ```
 
 To display and save labeled output, use this command instead of the first one:
 
 ```bash
-python3 H_Robotics_Files/read_outputs.py bluetooth --channel 1 | tee -a beaglebone_capture.txt
+python3 H_Robotics_Files/python/read_outputs.py bluetooth --channel 1 | tee -a beaglebone_capture.txt
 ```
 
 `tee -a` appends displayed records to the file. Connection messages and errors

@@ -5,7 +5,7 @@
 #include <array>
 #include <memory>
 #include <functional>
-#include "BleTrialClient.hpp"
+#include "../ble/BleTrialClient.hpp"
 #include <string>
 #include <list>
 #include <linux/spi/spidev.h>
