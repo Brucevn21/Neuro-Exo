@@ -5,7 +5,7 @@ Original reader modes use only the standard library. TCP sends command 0 only.
 Bluetooth mode receives Classic RFCOMM; it does not connect to a BLE service.
 ble-scan / ble-benchmark use Bleak to test a Nano 33 BLE (see docs/BLE_BENCHMARK.md).
 ble-preview displays synthetic Hardware_Interface records without hardware.
-protocol-* modes explain and exercise the bidirectional NeuroExo trial protocol.
+protocol-* modes encode, decode, simulate, and run the NeuroExo joint protocol (service 180C).
 CAL, TEST, RAW, and IMU records require an added exporter in the C++ producer.
 """
 

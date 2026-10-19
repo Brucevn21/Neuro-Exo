@@ -25,8 +25,9 @@ IDE. Keep receiver_protocol.h in the same folder. Install the official
 Arduino Mbed OS Nano Boards package and ArduinoBLE library version 1.3.7.
 Select **Arduino Nano 33 BLE** and its USB port, then compile and upload.
 Sender and receiver must both use protocol version 2; re-upload if the old
-benchmark receiver is installed. The 180C/2A56 angle/I2C sketch is not compatible.
-Uploading replaces the application currently on the Nano.
+benchmark receiver is installed. The NeuroExo bridge firmware (Nano33BLEFirmware,
+service 180C) is not compatible. Uploading replaces it; re-upload the bridge
+firmware from the ProtocolDemo branch after benchmarking.
 
 Alternatively, use the standalone PlatformIO project:
 

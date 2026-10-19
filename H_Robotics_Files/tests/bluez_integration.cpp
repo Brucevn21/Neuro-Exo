@@ -1,6 +1,8 @@
-// Exercises the actual BlueZ D-Bus client against an isolated fake org.bluez.
-// No system Bluetooth adapter or external network is accessed.
-#include "../ble/BleTrialClient.hpp"
+// Exercises the actual BlueZ D-Bus client against an isolated fake org.bluez
+// whose "Nano" relays to a simple Teensy model: 50 Hz telemetry, keepalive
+// frames, TargetReached, the 250 ms watchdog, and a latched SafetyFault.
+// No Bluetooth adapter is used.
+#include "../ble/BleJointClient.hpp"
 #include <gio/gio.h>
 #include <atomic>
 #include <condition_variable>
@@ -8,6 +10,7 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -15,12 +18,13 @@ namespace neuroexo {
 std::unique_ptr<GattTransport> makeBluezGattForTests(const std::string&);
 }
 namespace {
+namespace proto = NeuroExoProtocol;
+using namespace std::chrono_literals;
 const char* adapter = "/org/bluez/hci0";
 const char* device = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF";
 const char* service = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001";
 const char* command = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0001";
-const char* event = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0002";
-const char* info = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0003";
+const char* telemetry = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0002";
 const char* xml = R"XML(
 <node>
 <interface name="org.freedesktop.DBus.ObjectManager">
@@ -52,11 +56,16 @@ const char* xml = R"XML(
 </interface>
 </node>)XML";
 void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+int64_t nowMs() { return g_get_monotonic_time() / 1000; }
 
 class FakeBluez {
  public:
-  std::atomic<bool> drop{false}, badSequence{false}, disconnectOnWrite{false}, badFlags{false};
-  std::atomic<unsigned> writes{0};
+  // Fault injection, set from the test thread.
+  std::atomic<bool> badFlags{false}, disconnectOnWrite{false}, silent{false}, corrupt{false},
+                    faultOnMotion{false}, rejectCommands{false}, neverReach{false};
+  std::atomic<unsigned> writes{0}, validWrites{0}, trajectories{0};
+  std::atomic<int> lastTarget{0}, lastMode{-1}, lastSpeed{-1};
+  std::atomic<bool> lastWriteWithResponse{false};
   FakeBluez() {
     daemon_ = g_test_dbus_new(G_TEST_DBUS_NONE);
     g_test_dbus_up(daemon_);
@@ -79,6 +88,10 @@ class FakeBluez {
     g_test_dbus_down(daemon_);
     g_object_unref(daemon_);
   }
+  void reset() {
+    badFlags = disconnectOnWrite = silent = corrupt = faultOnMotion = rejectCommands = neverReach = false;
+    writes = validWrites = trajectories = 0;
+  }
   std::string address;
  private:
   GVariant* property(const std::string& path, const char* name) {
@@ -90,15 +103,18 @@ class FakeBluez {
     if (!std::strcmp(name, "Device")) return g_variant_new_object_path(device);
     if (!std::strcmp(name, "Service")) return g_variant_new_object_path(service);
     if (!std::strcmp(name, "UUID")) {
-      const char* uuid = path == service ? "b7e20000-6a2b-4f10-9c31-8b674045a901" :
-                         path == command ? "b7e20001-6a2b-4f10-9c31-8b674045a901" :
-                         path == event ? "b7e20002-6a2b-4f10-9c31-8b674045a901" :
-                                         "b7e20003-6a2b-4f10-9c31-8b674045a901";
+      // BlueZ reports full lowercase 128-bit UUIDs for 16-bit SIG values.
+      const char* uuid = path == service ? "0000180c-0000-1000-8000-00805f9b34fb" :
+                         path == command ? "00002a56-0000-1000-8000-00805f9b34fb" :
+                                           "00002a57-0000-1000-8000-00805f9b34fb";
       return g_variant_new_string(uuid);
     }
     if (!std::strcmp(name, "Flags")) {
-      const char* flags[] = {path == command ? (badFlags ? "read" : "write") :
-                            path == event ? "notify" : "read", nullptr};
+      if (path == command) {
+        const char* flags[] = {"write", badFlags ? nullptr : "write-without-response", nullptr};
+        return g_variant_new_strv(flags, -1);
+      }
+      const char* flags[] = {"read", "notify", nullptr};
       return g_variant_new_strv(flags, -1);
     }
     return nullptr;
@@ -123,7 +139,7 @@ class FakeBluez {
   GVariant* managed() {
     GVariantBuilder objects;
     g_variant_builder_init(&objects, G_VARIANT_TYPE("a{oa{sa{sv}}}"));
-    for (const auto path : {adapter, device, service, command, event, info}) {
+    for (const auto path : {adapter, device, service, command, telemetry}) {
       GVariantBuilder interfaces;
       g_variant_builder_init(&interfaces, G_VARIANT_TYPE("a{sa{sv}}"));
       g_variant_builder_add(&interfaces, "{s@a{sv}}", interfaceFor(path), properties(path));
@@ -143,51 +159,88 @@ class FakeBluez {
       "emit failed");
     if (error) g_error_free(error);
   }
+  // Teensy model: a new command (or any command after a timeout) starts a
+  // trajectory at 1 deg per tick; identical frames only refresh the watchdog.
+  // At the target it holds and sets TargetReached after 5 settled ticks.
+  // 250 ms without a valid frame disables motion and clears a fault, but
+  // TargetReached stays latched until the next trajectory starts.
+  void publish() {
+    if (!connected_ || !notifying_ || silent) return;
+    const int64_t now = nowMs();
+    if (now - lastValid_ > proto::COMMAND_TIMEOUT_MS) {
+      timedOut_ = true; motion_ = false; fault_ = false;
+    }
+    if (motion_ && faultOnMotion) { fault_ = true; motion_ = false; }
+    const int goal = neverReach ? lastTarget - 3 : int(lastTarget);
+    if (motion_) {
+      angle_ += angle_ < goal ? 1 : angle_ > goal ? -1 : 0;
+      settled_ = angle_ == lastTarget ? settled_ + 1 : 0;
+      if (settled_ >= 5) reached_ = true;
+    }
+    proto::TelemetryPacket packet;
+    packet.currentAngleDeg = int16_t(angle_);
+    packet.currentMilliAmps = motion_ ? 800 : 0;
+    packet.status = uint8_t((motion_ ? 1 : 0) | (timedOut_ ? 2 : 0) | (invalid_ ? 4 : 0) |
+                            (fault_ ? 8 : 0) | (reached_ ? neuroexo::STATUS_TARGET_REACHED : 0));
+    uint8_t frame[proto::MAX_FRAME_SIZE];
+    const uint8_t length = proto::encodeTelemetryFrame(packet, frame);
+    if (corrupt) {
+      uint8_t bad[proto::MAX_FRAME_SIZE];
+      std::memcpy(bad, frame, length);
+      bad[4] ^= 0x40;  // CRC no longer matches
+      emit(telemetry, "org.bluez.GattCharacteristic1", "Value",
+           g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, bad, length, 1));
+    }
+    emit(telemetry, "org.bluez.GattCharacteristic1", "Value",
+         g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, frame, length, 1));
+  }
   void method(const std::string& path, const std::string& name,
               GVariant* params, GDBusMethodInvocation* invocation) {
     if (name == "GetManagedObjects") {
       g_dbus_method_invocation_return_value(invocation, managed()); return;
     }
-    if (name == "Connect") { connected_ = true; nano_.reset(); }
+    if (name == "Connect") { connected_ = true; }
     if (name == "Disconnect") {
-      connected_ = false; notifying_ = false; nano_.reset();
+      connected_ = false; notifying_ = false;
       emit(device, "org.bluez.Device1", "Connected", g_variant_new_boolean(FALSE));
     }
     if (name == "StartNotify") notifying_ = true;
     if (name == "StopNotify") notifying_ = false;
-    if (name == "ReadValue") {
-      neuroexo::Packet reply{};
-      nano_.info(reply.data());
-      g_dbus_method_invocation_return_value(invocation,
-        g_variant_new("(@ay)", g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
-                                                       reply.data(), reply.size(), 1)));
-      return;
-    }
     if (name == "WriteValue") {
       check(path == command && notifying_, "write before notification subscription");
       GVariant* bytes = g_variant_get_child_value(params, 0);
       GVariant* options = g_variant_get_child_value(params, 1);
       const gchar* type = nullptr;
-      const bool request = g_variant_lookup(options, "type", "&s", &type) &&
-                           std::strcmp(type, "request") == 0;
+      check(g_variant_lookup(options, "type", "&s", &type), "write type missing");
+      check(!std::strcmp(type, "request") || !std::strcmp(type, "command"), "unknown write type");
+      lastWriteWithResponse = !std::strcmp(type, "request");
       g_variant_unref(options);
-      check(request, "write must explicitly request ATT response");
       gsize length = 0;
       const auto* raw = static_cast<const uint8_t*>(g_variant_get_fixed_array(bytes, &length, 1));
-      neuroexo::Packet reply{};
-      const uint32_t now = uint32_t(g_get_monotonic_time() / 1000);
-      const bool accepted = nano_.process(raw, length, now, reply.data());
+      // Same path as Nano33BLEFirmware: parse, decode, then forward over I2C.
+      proto::FrameParser parser;
+      for (gsize i = 0; i < length; ++i) parser.push(raw[i]);
+      proto::Frame frame;
+      proto::ControlPacket packet;
+      const bool valid = length == 9 && parser.takeFrame(frame) && proto::decodeControlFrame(frame, packet);
       g_variant_unref(bytes);
-      check(accepted, "malformed command at fake Nano");
       ++writes;
+      check(valid, "malformed control frame at fake Nano");
       if (disconnectOnWrite) {
         connected_ = false;
         emit(device, "org.bluez.Device1", "Connected", g_variant_new_boolean(FALSE));
-      } else if (!drop) {
-        if (badSequence) ++reply[4];
-        // Emit before ATT WriteValue completes to check the early-reply race.
-        emit(event, "org.bluez.GattCharacteristic1", "Value",
-             g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, reply.data(), reply.size(), 1));
+      } else if (rejectCommands) {
+        invalid_ = true;  // the Teensy saw a bad I2C frame; lastValid_ is not refreshed
+      } else {
+        ++validWrites;
+        const bool same = int(packet.mode) == lastMode && int(packet.speed) == lastSpeed &&
+                          packet.targetAngleDeg == lastTarget;
+        const bool restart = !fault_ && (timedOut_ || !same);
+        invalid_ = false; timedOut_ = false; lastValid_ = nowMs();
+        if (restart) {
+          lastMode = int(packet.mode); lastSpeed = int(packet.speed); lastTarget = packet.targetAngleDeg;
+          motion_ = true; reached_ = false; settled_ = 0; ++trajectories;
+        }
       }
     }
     g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
@@ -227,18 +280,25 @@ class FakeBluez {
     check(node != nullptr, "introspection XML failed");
     static const GDBusInterfaceVTable vtable = {onMethod, onProperty, nullptr, {nullptr}};
     std::vector<guint> registrations;
-    for (const auto path : {"/", adapter, device, service, command, event, info}) {
+    for (const auto path : {"/", adapter, device, service, command, telemetry}) {
       const auto* interface = interfaceFor(path);
       const guint id = g_dbus_connection_register_object(bus_, path,
         g_dbus_node_info_lookup_interface(node, interface), &vtable, this, nullptr, &error);
       check(id != 0, "register object failed");
       registrations.push_back(id);
     }
+    GSource* tick = g_timeout_source_new(20);  // the Nano polls the Teensy at 50 Hz
+    g_source_set_callback(tick, [](gpointer self) -> gboolean {
+      static_cast<FakeBluez*>(self)->publish(); return G_SOURCE_CONTINUE;
+    }, this, nullptr);
+    g_source_attach(tick, context_);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       ready_ = true; cv_.notify_all();
     }
     g_main_loop_run(loop_);
+    g_source_destroy(tick);
+    g_source_unref(tick);
     for (auto id : registrations) g_dbus_connection_unregister_object(bus_, id);
     g_dbus_node_info_unref(node);
     g_dbus_connection_close_sync(bus_, nullptr, nullptr);
@@ -255,47 +315,124 @@ class FakeBluez {
   std::mutex mutex_;
   std::condition_variable cv_;
   bool ready_ = false, connected_ = false, notifying_ = false;
+  bool motion_ = false, timedOut_ = true, invalid_ = false, fault_ = false, reached_ = false;
+  int angle_ = 0, settled_ = 0;
+  int64_t lastValid_ = 0;
   std::string error_;
-  neuroexo::Simulator nano_;
 };
-template<class F> void rejects(F operation, const char* message) {
-  try { operation(); } catch (const std::exception&) { return; }
+template<class F> std::string rejects(F operation, const char* message) {
+  try { operation(); } catch (const std::exception& error) { return error.what(); }
   throw std::runtime_error(message);
 }
+void contains(const std::string& text, const char* part, const char* message) {
+  if (text.find(part) == std::string::npos) throw std::runtime_error(std::string(message) + ": " + text);
 }
+}  // namespace
+
 int main() {
   try {
     FakeBluez server;
+    const neuroexo::JointCommand command{proto::Mode::Assistive, proto::Speed::High, 10};
+    const neuroexo::JointCommand far{proto::Mode::Assistive, proto::Speed::High, 100};
     {
-      neuroexo::BleTrialClient client(neuroexo::makeBluezGattForTests(server.address));
+      neuroexo::BleJointClient client(neuroexo::makeBluezGattForTests(server.address));
       client.connect("aa:bb:cc:dd:ee:ff");
-      check(client.simulated(), "simulation flag missing");
-      client.calibrate();
-      client.setMaximumPosition(90);
-      const auto timing = client.runTrial({1, 60, 0, 30}, std::chrono::milliseconds(130));
-      check(timing.positionReplies >= 2, "position feedback missing");
-      check(client.position(1).state == neuroexo::ENDED, "End not delivered");
-      rejects([&] { client.configure({2, 100, 0, 30}); }, "out-of-range configuration accepted");
+      // Monitoring alone never writes.
+      const auto first = client.waitForTelemetry(1000ms);
+      check(first.commandTimeout() && !first.motionActive(), "idle telemetry should show CommandTimeout");
+      check(server.writes == 0, "monitoring wrote a command");
+      unsigned seen = 0;
+      int maxAngle = 0;
+      auto result = client.runTrial(command, 3000ms, 100ms,
+        [&](const neuroexo::JointTelemetry& t) { ++seen; maxAngle = std::max<int>(maxAngle, t.angleDeg); });
+      check(result.targetReached && result.stopConfirmed, "target or stop not confirmed");
+      check(result.commandsSent >= 3 && result.commandsSent == server.validWrites, "keepalive count");
+      check(server.trajectories == 1, "keepalive frames restarted the trajectory");
+      check(result.elapsedMs < 1500, "trial did not end at TargetReached");
+      check(result.telemetryFrames == seen && seen >= 10, "telemetry not delivered at ~50 Hz");
+      check(server.lastTarget == 10 && server.lastMode == 1 && server.lastSpeed == 2, "command fields");
+      check(server.lastWriteWithResponse, "default write must request an ATT response");
+      check(maxAngle == 10, "angle did not reach the target");
+      check(client.rejectedNotifications() == 0, "valid telemetry rejected");
+
+      // Same target again: the idle telemetry still carries the old
+      // TargetReached bit (with CommandTimeout); it must not end the trial.
+      {
+        neuroexo::JointTelemetry idle;
+        check(client.latestTelemetry(idle) && idle.targetReached() && idle.commandTimeout(),
+              "fake should latch TargetReached while idle");
+      }
+      result = client.runTrial(command, 3000ms);
+      // The fake needs 5 ticks (100 ms) of settling after the new trajectory starts.
+      check(result.targetReached && server.trajectories == 2 && result.elapsedMs >= 80,
+            "stale TargetReached ended the trial early");
+
+      // Never settles: the time limit ends the trial and keepalives stop.
+      server.neverReach = true;
+      contains(rejects([&] { client.runTrial(command, 600ms); }, "time limit ignored"),
+               "target not reached", "wrong time-limit error");
+      const unsigned writesAtLimit = server.writes;
+      std::this_thread::sleep_for(300ms);
+      check(server.writes == writesAtLimit, "commands continued after the time limit");
+      server.neverReach = false;
+
+      client.setWriteWithResponse(false);
+      client.send(command);
+      check(!server.lastWriteWithResponse, "write-without-response not used");
+      client.setWriteWithResponse(true);
+      std::this_thread::sleep_for(300ms);  // let the fake time out again
+
+      server.corrupt = true;
+      client.takeTelemetry();
+      std::this_thread::sleep_for(200ms);
+      const auto frames = client.takeTelemetry();
+      check(!frames.empty() && client.rejectedNotifications() > 0, "corrupt frames not rejected");
+      server.corrupt = false;
+
+      // A latched SafetyFault ends the trial, and keepalives stop.
+      server.faultOnMotion = true;
+      contains(rejects([&] { client.runTrial(far, 2000ms); }, "SafetyFault ignored"),
+               "safety fault", "wrong fault error");
+      const unsigned writesAtFault = server.writes;
+      std::this_thread::sleep_for(300ms);
+      check(server.writes == writesAtFault, "commands continued after SafetyFault");
+      server.faultOnMotion = false;
+
+      // The Teensy rejects every frame: CommandTimeout persists while sending.
+      server.rejectCommands = true;
+      contains(rejects([&] { client.runTrial(far, 2000ms); }, "CommandTimeout ignored"),
+               "CommandTimeout", "wrong timeout error");
+      server.rejectCommands = false;
+
+      // Telemetry stops mid-trial.
+      unsigned frames2 = 0;
+      contains(rejects([&] {
+        client.runTrial(far, 3000ms, 100ms, [&](const neuroexo::JointTelemetry&) {
+          if (++frames2 == 5) server.silent = true;
+        });
+      }, "silence ignored"), "telemetry stopped", "wrong silence error");
+      server.silent = false;
       client.disconnect();
     }
-    for (int failure = 0; failure < 3; ++failure) {
-      neuroexo::BleTrialClient client(neuroexo::makeBluezGattForTests(server.address));
+    server.reset();
+    {
+      neuroexo::BleJointClient client(neuroexo::makeBluezGattForTests(server.address));
       client.connect("AA:BB:CC:DD:EE:FF");
-      client.setTimeout(100);
-      server.drop = failure == 0;
-      server.badSequence = failure == 1;
-      server.disconnectOnWrite = failure == 2;
-      rejects([&] { client.calibrate(); }, "bad/disconnected/missing reply accepted");
-      check(!client.connected(), "failed transport remained usable");
-      server.drop = server.badSequence = server.disconnectOnWrite = false;
+      server.disconnectOnWrite = true;
+      client.send(command);  // the link drop arrives as a signal after the write
+      std::this_thread::sleep_for(100ms);
+      check(!client.connected(), "disconnect not detected");
+      rejects([&] { client.send(command); }, "write after disconnect accepted");
+      server.disconnectOnWrite = false;
     }
     server.badFlags = true;
     {
-      neuroexo::BleTrialClient client(neuroexo::makeBluezGattForTests(server.address));
+      neuroexo::BleJointClient client(neuroexo::makeBluezGattForTests(server.address));
       rejects([&] { client.connect("AA:BB:CC:DD:EE:FF"); }, "bad characteristic flags accepted");
     }
-    std::cout << "BlueZ integration: discovery, flags, early replies, full trial, rejection, "
-                 "timeout, bad sequence, disconnect, cleanup PASS\n";
+    std::cout << "BlueZ integration: discovery, flags, run-to-TargetReached, keepalive without "
+                 "restart, stale TargetReached, time limit, stop confirmation, write types, CRC "
+                 "rejection, SafetyFault, CommandTimeout, silence, disconnect PASS\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

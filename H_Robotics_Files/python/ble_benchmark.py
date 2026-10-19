@@ -368,7 +368,7 @@ async def benchmark(args, scanner, client_factory):
             print(f"Connected to {device.address}; GATT value size <= {write_size} bytes (10-byte header).")
             print("Payload sizes exclude headers and CRC.")
             if args.profile == "hardware-eeg":
-                print("Modeling eight-channel C++ debug text over BLE; requires benchmark receiver v2, not angle/I2C firmware.")
+                print("Modeling eight-channel C++ debug text over BLE; requires benchmark receiver v2, not the 180C bridge firmware.")
             if args.pacing == "source-loop":
                 print(f"Source-loop pacing: 4 ms + {args.processing_delay_ms:g} ms simulated work + formatting/send time.")
             else:

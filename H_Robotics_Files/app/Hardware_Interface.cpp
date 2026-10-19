@@ -41,7 +41,7 @@
 using namespace std;
 
 Hardware_Interface::Hardware_Interface()
-    : ble_(new neuroexo::BleTrialClient(neuroexo::makeBluezGatt())) {}
+    : ble_(new neuroexo::BleJointClient(neuroexo::makeBluezGatt())) {}
 
 Hardware_Interface::~Hardware_Interface()
 {
@@ -775,7 +775,7 @@ void Hardware_Interface::changeBuff(unsigned char *hex, int fd, spi_ioc_transfer
     }
     ioctl(fd, SPI_IOC_MESSAGE(1), transfer);
 }
-// Arm communication uses the trial GATT service; sensor acquisition stays local.
+// Arm communication uses the Nano's 180C GATT service; sensor acquisition stays local.
 void Hardware_Interface::setBluetoothDevice(const std::string& address, const std::string& adapter)
 {
     disconnectBluetooth();
@@ -789,8 +789,7 @@ bool Hardware_Interface::connectToBluetoothDevice()
         if (btAddress.empty())
             throw std::runtime_error("Set the Nano address with setBluetoothDevice(address) first");
         ble_->connect(btAddress, btAdapter);
-        std::cout << "Connected to Nano over BLE GATT"
-                  << (ble_->simulated() ? " (SIMULATED arm)" : "") << std::endl;
+        std::cout << "Connected to " << neuroexo::NANO_NAME << " over BLE GATT" << std::endl;
         return true;
     } catch (const std::exception& error) {
         std::cerr << "BLE connection failed: " << error.what() << std::endl;
@@ -810,74 +809,55 @@ void Hardware_Interface::disconnectBluetooth()
 }
 
 bool Hardware_Interface::isBluetoothConnected() const { return ble_->connected(); }
-bool Hardware_Interface::isBluetoothSimulated() const { return ble_->simulated(); }
 
-void Hardware_Interface::calibrateArm()
+void Hardware_Interface::recordTelemetry(const neuroexo::JointTelemetry& telemetry)
+{
+    armPositionDegrees_.store(telemetry.angleDeg);
+}
+
+void Hardware_Interface::sendArmCommand(const neuroexo::JointCommand& command)
 {
     requireBluetooth();
-    ble_->calibrate();
+    ble_->send(command);
 }
 
-void Hardware_Interface::setMaxPosition(double degrees)
+std::vector<neuroexo::JointTelemetry> Hardware_Interface::takeArmTelemetry()
 {
-    requireBluetooth();
-    ble_->setMaximumPosition(degrees);
+    auto frames = ble_->takeTelemetry();
+    if (!frames.empty()) recordTelemetry(frames.back());
+    return frames;
 }
 
-void Hardware_Interface::configureTrial(const neuroexo::TrialSettings& settings)
-{
-    requireBluetooth();
-    ble_->configure(settings);
-}
-
-void Hardware_Interface::startTrial(uint16_t trial)
-{
-    requireBluetooth();
-    ble_->start(trial);
-}
-
-neuroexo::ArmPosition Hardware_Interface::readArmPosition(uint16_t trial)
-{
-    requireBluetooth();
-    const auto position = ble_->position(trial);
-    armPositionMilliDegrees_.store(int32_t(std::llround(position.degrees * neuroexo::SCALE)));
-    return position;
-}
-
-void Hardware_Interface::endTrial(uint16_t trial)
-{
-    // Never reconnect just to send End: a new connection is a new receiver session.
-    if (!ble_->connected()) throw std::runtime_error("Cannot confirm End: Nano disconnected");
-    ble_->end(trial);
-}
-
-neuroexo::TrialTiming Hardware_Interface::runArmTrial(
-    const neuroexo::TrialSettings& settings, std::chrono::milliseconds duration,
-    std::function<void(const neuroexo::ArmPosition&)> onPosition,
+neuroexo::TrialResult Hardware_Interface::runArmTrial(
+    const neuroexo::JointCommand& command, std::chrono::milliseconds timeLimit,
+    std::function<void(const neuroexo::JointTelemetry&)> onTelemetry,
     std::function<bool()> shouldStop)
 {
     requireBluetooth();
-    return ble_->runTrial(settings, duration, std::chrono::milliseconds(40),
-        [this, onPosition](const neuroexo::ArmPosition& position) {
-            armPositionMilliDegrees_.store(int32_t(std::llround(position.degrees * neuroexo::SCALE)));
-            if (onPosition) onPosition(position);
+    return ble_->runTrial(command, timeLimit, std::chrono::milliseconds(100),
+        [this, onTelemetry](const neuroexo::JointTelemetry& telemetry) {
+            recordTelemetry(telemetry);
+            if (onTelemetry) onTelemetry(telemetry);
         }, shouldStop);
 }
 
 void Hardware_Interface::Arm_setup(double& maxPosition)
 {
-    // The protocol does not invent a measured limit: caller supplies degrees.
-    if (!std::isfinite(maxPosition) || maxPosition <= 0 || maxPosition > 360)
-        throw std::invalid_argument("Arm_setup requires a maximum position in (0,360] degrees");
-    calibrateArm();
-    setMaxPosition(maxPosition);
+    // No calibration or limit exists in the 180C protocol; confirm that the
+    // Nano -> Teensy chain is alive instead. maxPosition is left unchanged.
+    (void)maxPosition;
+    requireBluetooth();
+    recordTelemetry(ble_->waitForTelemetry(std::chrono::milliseconds(1000)));
 }
 
 void Hardware_Interface::debugArm()
 {
-    const auto position = readArmPosition(0);
-    std::cout << "Arm position: " << position.degrees << " deg"
-              << (position.simulated ? " [SIMULATED]" : "") << std::endl;
+    // Read-only: listens to telemetry and never commands motion.
+    requireBluetooth();
+    const auto telemetry = ble_->waitForTelemetry(std::chrono::milliseconds(1000));
+    recordTelemetry(telemetry);
+    std::cout << "Arm angle: " << telemetry.angleDeg << " deg, current: " << telemetry.milliAmps
+              << " mA, status: 0x" << std::hex << int(telemetry.status) << std::dec << std::endl;
 }
 
 void Hardware_Interface::logEEGEOG(const MatrixXd& eeg_eog)

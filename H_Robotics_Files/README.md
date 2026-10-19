@@ -1,9 +1,11 @@
 # Current BLE arm interface
 
-The hardware interface now implements the NeuroExo trial protocol over BlueZ
-BLE GATT. See [NEUROEXO_PROTOCOL.md](docs/NEUROEXO_PROTOCOL.md) for packet definitions,
-the Python reader, the C++ build/run procedure, and the matching Nano receiver.
-The supplied receiver simulates position; the old angle/I2C sketch is incompatible.
+The hardware interface talks to the Nano 33 BLE bridge (`Nano33BLE_Master`,
+service 180C) over BlueZ BLE GATT. The Nano relays framed control messages to the
+Teensy 4.1 over I2C and returns 50 Hz telemetry. See
+[NEUROEXO_PROTOCOL.md](docs/NEUROEXO_PROTOCOL.md) for the frame format, keepalive
+and stop rules, the Python tools, and the C++ build. These commands drive the
+real motor; the Nano/Teensy firmware is on the ProtocolDemo branch.
 
 The source walkthrough below is historical: it describes the pre-refactor
 TCP/RFCOMM version. Its old transport APIs and several listed defects have since
@@ -20,8 +22,8 @@ C++ debug record format and pacing while leaving the reference C++ unchanged.
 | Folder | Contents |
 |---|---|
 | [app/](app/) | Original BBB acquisition application: main.cpp, Hardware_Interface.cpp/hpp. |
-| [ble/](ble/) | C++ BLE arm client library (neuroexo_ble): BleTrialClient, BluezGatt. |
-| [firmware/](firmware/) | Nano 33 BLE sketches: NanoNeuroExoProtocol (trial protocol), NanoBLEBenchmark (load test). |
+| [ble/](ble/) | C++ BLE arm client library (neuroexo_ble): BleJointClient, BluezGatt. |
+| [firmware/](firmware/) | commProtocol (vendored copy of the firmware codec), NanoBLEBenchmark (load-test sketch). |
 | [python/](python/) | read_outputs.py CLI and its modules; requirements-ble.txt. |
 | [examples/](examples/) | Standalone C++ BLE trial program. |
 | [tests/](tests/) | Python and C++ tests; hardware_stubs are test-only substitutes. |

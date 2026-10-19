@@ -1,110 +1,168 @@
-# NeuroExo arm protocol: BeagleBone Black Wireless ↔ Nano 33 BLE
+# NeuroExo joint protocol: BeagleBone Black Wireless ↔ Nano 33 BLE ↔ Teensy 4.1
 
-This implements the communication sequence in the supplied NeuroExo diagram.
-It is separate from the existing packet-throughput benchmark.
+The BeagleBone Black (BBB) is the BLE central. It writes framed control
+messages to the Nano 33 BLE. The Nano validates each frame and forwards it
+over I2C to the Teensy 4.1 motor controller. It also polls the Teensy for
+telemetry and notifies the BBB with each valid frame.
 
-**The earlier 180C/2A56 angle/I2C firmware cannot decode this protocol. Upload
-NanoNeuroExoProtocol first. The supplied receiver simulates arm position and
-does not drive a motor, calibrate real hardware, or issue I2C commands.**
-It runs on a physical Nano over real BLE, but its position values are simulated.
+```text
+ BeagleBone Black ──BLE write 2A56──► Nano 33 BLE ──I2C 0x08──► Teensy 4.1 ──► ESCON ──► motor
+   (BLE central)  ◄─BLE notify 2A57── "Nano33BLE_Master" ◄─I2C read── (PID loop, AS5045 encoder)
+```
 
-## What is implemented
+The Nano and Teensy firmware live in `NeuroExoFirmware/` on the `ProtocolDemo`
+branch (`src/Nano33BLEFirmware.ino`, `src/main.cpp`, `lib/commProtocol/`).
+This folder contains the BBB side, plus a vendored copy of the shared codec in
+[firmware/commProtocol](../firmware/commProtocol/README.md).
 
-- Hardware_Interface.cpp/hpp now use BleTrialClient and BluezGatt for arm commands.
-  The class's TCP helpers, Python socket bridge, and Classic RFCOMM socket code
-  have been removed. main.cpp's visible cleanup call uses disconnectBluetooth().
-- BluezGatt uses the official BlueZ GATT D-Bus API through GIO. BlueZ must be
-  running on the BBB. Linking libbluetooth alone would not implement this GATT
-  client. The old code already used BlueZ, but through Classic RFCOMM.
-- read_outputs.py has protocol-demo, protocol-decode, protocol-scan, and
-  protocol-run modes, with decoded TX/RX, sequence numbers, optional hex, and
-  optional JSONL traces. Existing benchmark/legacy reader modes remain available.
-- NanoNeuroExoProtocol uses ArduinoBLE's BLEWritten callback and BLE.poll().
-  This is a BLE event callback, not a GPIO interrupt service routine.
-- The C++ and Python clients use the same 20-byte packet layout and Nano parser.
-- The original sensor acquisition remains local to the BBB. Debug EEG text now
-  goes to stdout (read_outputs.py stdin can label it), not to the arm characteristic.
-  The acquisition loop still sleeps 4 ms plus work; exact 250 Hz is unverified.
+**`protocol-run`, `neuroexo_ble_trial` without `--monitor`, `runArmTrial()`,
+and `sendArmCommand()` all command real motor motion.**
 
-## Diagram mapping
+## BLE interface
 
-| Diagram stage | BBB sends | Nano replies |
-|---|---|---|
-| Calibrate arm | CALIBRATE | ACK |
-| Set maximum position | SET_MAX | ACK |
-| Look at dot / blink | Local application phase; no arm message | None |
-| 1. Target, starting position, assistance | CONFIGURE | ACK READY |
-| 2. Initial arm position | GET_POSITION | POSITION READY |
-| 3. Start command | START | ACK RUNNING |
-| 4. Arm-position feedback | GET_POSITION every 40 ms | POSITION for each request |
-| 5. End command | END | ACK ENDED |
-| Repeat trials | A new nonzero trial ID | Same sequence |
+| Item | Value |
+|---|---|
+| Local name | `Nano33BLE_Master` |
+| Service | `180C` (`0000180c-0000-1000-8000-00805f9b34fb`) |
+| Command | `2A56`: Write and Write Without Response. BBB → Nano control frames, 9 bytes. |
+| Telemetry | `2A57`: Read and Notify. Nano → BBB telemetry frames, 10 bytes, 50 Hz while connected. |
 
-This interprets the earlier requirement as **a BBB request every 40 ms**, with
-one Nano position response per request. Configure, Start, and End happen once
-per trial. No EEG samples are sent to the Nano by this arm-control protocol.
-EEG acquisition and SVM processing may continue on their own application thread.
+The Nano publishes telemetry only after a successful I2C read that validates.
+If the Teensy is unpowered or unwired, the BBB connects but receives no
+telemetry. Both BBB clients treat that as an error.
 
-The polling schedule uses monotonic deadlines. Slow requests cause missed
-periods to be counted and skipped; there are no catch-up bursts. This is a
-25 Hz target, not a hard real-time guarantee. A successful ATT write is followed
-by a matching application reply before the command is considered accepted.
-The duration argument controls trial length, not the time to reach the target.
+## Frame format
 
-## Try the readable protocol without hardware
+```text
+STX | TYPE | LENGTH | PAYLOAD | CRC8 | ETX
+```
 
-From the repository root in WSL, Linux, or another Python environment:
+| Field | Size | Description |
+|---|---:|---|
+| STX | 1 | Start marker, always `0x02` |
+| TYPE | 1 | `0x10` control or `0x11` telemetry |
+| LENGTH | 1 | Payload length: 4 for control, 5 for telemetry |
+| PAYLOAD | 4 or 5 | Message-specific, signed 16-bit values big-endian |
+| CRC8 | 1 | CRC-8, polynomial `0x07`, initial value `0`, over TYPE, LENGTH and PAYLOAD |
+| ETX | 1 | Stop marker, always `0x03` |
+
+### Control frame (9 bytes, BBB → Nano → Teensy)
+
+| Byte | Field | Values |
+|---:|---|---|
+| 3 | MODE | `0` Resistive, `1` Assistive, `2` Neutral |
+| 4 | SPEED | `0` Slow, `1` Medium, `2` High |
+| 5–6 | targetAngleDeg | int16, big-endian, degrees |
+
+Example: Assistive, High, target −123° (`0xFF85`):
+
+```text
+02 10 04 01 02 FF 85 94 03
+```
+
+### Telemetry frame (10 bytes, Teensy → Nano → BBB)
+
+| Byte | Field | Description |
+|---:|---|---|
+| 3–4 | currentAngleDeg | int16, big-endian, degrees |
+| 5–6 | currentMilliAmps | int16, big-endian, milliamps |
+| 7 | status | Bit field below |
+
+| Bit | Name | Meaning |
+|---:|---|---|
+| 0 | MotionActive | The controller is driving the joint: moving along a trajectory or holding the target |
+| 1 | CommandTimeout | No valid control frame for 250 ms; motor disabled (idle) |
+| 2 | InvalidCommand | The most recent I2C command was invalid |
+| 3 | SafetyFault | Controller e-stop latched (over-speed, overcurrent, invalid sensor data, or tracking error). Commands are ignored until none arrives for 250 ms. |
+| 4 | TargetReached | **Proposed firmware addition.** The measured angle has settled within tolerance of the target. Cleared when a new trajectory starts; may stay set while idle. |
+
+> **Firmware status:** bit 4 and the keepalive rules below are what the BBB
+> code now expects. The firmware on `ProtocolDemo` (`39eac5b`) does not
+> implement them yet. Against that firmware, a trial never sees TargetReached
+> and ends at its time limit with an error.
+
+Example: angle 45°, 1200 mA, MotionActive:
+
+```text
+02 11 05 00 2D 04 B0 01 52 03
+```
+
+> **CRC note:** the protocol README in `NeuroExoFirmware/lib/commProtocol` shows
+> these examples with CRC bytes `AA` and `14`. The firmware's `crc8()` computes
+> `94` and `52`, and the firmware rejects the README's bytes. The values above
+> come from the firmware code, and tests check them against it.
+
+## How the BBB drives a trial
+
+The Teensy's control algorithm owns the motion: the trajectory, the control
+loop, and deciding when the target is reached. The BBB only relays a start
+signal, keeps it alive, and goes quiet when the Teensy says it's done.
+
+Teensy rules (proposed; see Firmware status above):
+
+- **Start.** A control frame that differs from the active command (mode,
+  speed, or target), or any valid frame after a timeout, starts a new
+  trajectory from the current angle and clears TargetReached.
+- **Keepalive.** An identical frame only refreshes the 250 ms watchdog. It
+  never restarts or alters the trajectory.
+- **Done.** When the angle settles within tolerance of the target, the Teensy
+  sets TargetReached and holds the target while keepalives continue.
+- **Idle.** After 250 ms without a valid frame, the Teensy sets
+  CommandTimeout, clears MotionActive, and disables the motor (joint
+  backdrivable). The watchdog also stops the joint if the BBB or BLE link
+  fails mid-move.
+
+BBB sequence (`BleJointClient::runTrial`, `protocol-run`):
+
+1. **Precondition.** Wait up to 1 s for telemetry. Refuse to start if
+   SafetyFault is latched.
+2. **Start and keepalive.** Write the control frame, then repeat it every
+   `period` (default 100 ms, allowed 20–150 ms).
+3. **Watch for done.** Stop repeating at the first telemetry frame with
+   TargetReached and MotionActive set and CommandTimeout clear. A
+   TargetReached left over from the previous move arrives with CommandTimeout
+   set, so it is ignored.
+4. **Abort.** Stop writing and report an error if any of these occurs:
+   - The time limit passes before TargetReached. The default is 150 s, which
+     covers Slow's 120 s trajectory.
+   - SafetyFault is set.
+   - No telemetry arrives for 500 ms.
+   - CommandTimeout is still set more than 400 ms into the trial, which means
+     the Teensy is not accepting the frames.
+   - The BLE link fails.
+5. **Confirm idle.** Wait up to 1 s for telemetry showing CommandTimeout
+   without MotionActive, received more than 250 ms after the last write.
+
+Writes happen only on the thread that runs the trial, and there is no
+background keepalive. If the program crashes, hangs, or throws, the writes stop,
+and the Teensy disables motion within 250 ms. Ctrl+C has the same effect.
+After a SafetyFault, wait at least 250 ms without writing before the next
+trial. The CLIs enforce `--rest ≥ 0.3 s` between trials.
+
+## Try it without hardware
+
+From the repository root:
 
 ~~~bash
-python3 H_Robotics_Files/python/read_outputs.py protocol-demo --duration 0.16 --hex
+python3 H_Robotics_Files/python/read_outputs.py protocol-encode --mode assistive --speed high --target -123
+python3 H_Robotics_Files/python/read_outputs.py protocol-decode "02 11 05 00 2D 04 B0 01 52 03"
+python3 H_Robotics_Files/python/read_outputs.py protocol-demo --speed high --target 45 --hex
 ~~~
 
-This runs in **virtual time**, with simulated arm position and no Bleak
-dependency. It exercises calibration, maximum, configuration, initial position,
-Start, four 40 ms position requests, and End. It does not measure performance.
+`protocol-demo` runs in **virtual time**. A `SimulatedJoint` model stands in
+for the Nano and Teensy and follows the proposed rules above: keepalive,
+TargetReached (within 2° for 0.2 s, assumed values), the timeout, and faults.
+Its angle follows the setpoint exactly, and its current value is a placeholder.
+It does not measure Bluetooth or motor timing. `--print-every N` (default 5)
+thins the terminal output, but status changes always print.
+`--log trace.jsonl` writes every frame's bytes and decoded fields. Existing
+logs are never overwritten.
+
+## Run over the BBB's Bluetooth (Python)
+
+Run this on the BBB from the repository root, with Python 3.9+ and BlueZ 5.55+:
 
 ~~~bash
-python3 H_Robotics_Files/python/read_outputs.py protocol-demo \
-  --trials 20 --duration 2 --start 0 --target 60 --assistance 30 \
-  --log protocol_trace_demo.jsonl
-~~~
-
-Every JSONL record includes raw hex and decoded fields. Existing log files are
-never overwritten. To decode a single captured 20-byte value:
-
-~~~bash
-python3 H_Robotics_Files/python/read_outputs.py protocol-decode \
-  "4e 01 03 00 03 00 01 00 60 ea 00 00 00 00 00 00 30 75 00 00"
-~~~
-
-That example is CONFIGURE, sequence 3, trial 1, target 60 degrees, starting
-position 0 degrees, and assistance velocity 30 degrees/second.
-
-## Load the matching Nano receiver
-
-1. Open firmware/NanoNeuroExoProtocol/NanoNeuroExoProtocol.ino in Arduino IDE. Keep
-   trial_protocol.h alongside it.
-2. Use Arduino Nano 33 BLE, the Arduino Mbed OS Nano Boards package, and the
-   ArduinoBLE library (the project specifies version 1.3.7).
-3. Compile and upload. Uploading replaces the existing angle/I2C sketch.
-4. Power the board. It advertises **NanoNeuroExo**, not NanoBLEBench.
-   The Serial Monitor is optional; it does not print each packet.
-5. Disconnect other BLE clients before running either sender.
-
-A PlatformIO project is also supplied in that directory. Target compilation
-and upload require the Arduino toolchain/dependencies and have not been run
-in this workspace.
-
-## Run Python over the BBB's Bluetooth
-
-Copy H_Robotics_Files to the BBB's project checkout. Do not reuse a laptop's
-virtual environment or compiled binaries. Use WSL as an SSH terminal to the
-BBB (commonly ssh debian@192.168.7.2 over USB); run the following on the BBB.
-
-From the repository root, with Python 3.9+ and BlueZ 5.55+:
-
-~~~bash
-bluetoothctl show
 bluetoothctl power on
 python3 -m venv H_Robotics_Files/.venv
 source H_Robotics_Files/.venv/bin/activate
@@ -112,191 +170,95 @@ python3 -m pip install -r H_Robotics_Files/python/requirements-ble.txt
 python3 H_Robotics_Files/python/read_outputs.py protocol-scan
 ~~~
 
-Replace the example address with the address printed beside NanoNeuroExo:
+Start with telemetry only. This never writes a command:
+
+~~~bash
+python3 H_Robotics_Files/python/read_outputs.py protocol-monitor --address AA:BB:CC:DD:EE:FF --duration 5
+~~~
+
+Then, with the joint clear and the e-stop within reach:
 
 ~~~bash
 python3 H_Robotics_Files/python/read_outputs.py protocol-run \
-  --address AA:BB:CC:DD:EE:FF --trials 1 --duration 2 \
-  --interval-ms 40 --start 0 --target 60 --assistance 30 \
-  --max-position 90 --hex --log protocol_trace_live.jsonl
+  --address AA:BB:CC:DD:EE:FF --mode assistive --speed medium --target 45 \
+  --time-limit 60 --trials 1 --hex --log protocol_trace_live.jsonl
 ~~~
 
-The position remains simulated by the Nano. This tests the actual BLE path
-and parsing. Use --trials 20 for the diagram. --baseline-seconds adds a local
-pause for the dot/blink phase; it does not collect EEG or display a visual cue.
+`--write-without-response` uses an ATT write command instead of a write
+request. Only one central can connect to the Nano at a time, so close the
+patient app or any other client first.
 
-Run only one sender at a time. The Python prototype requires the simulation
-flag; it deliberately rejects an unrecognized or different receiver protocol.
-Ctrl+C attempts End and disconnects. Do not automatically retry Start after
-an uncertain write. Reconnect and restart the protocol after an error.
+## Build and run the C++ client
 
-## Build and run the new C++ sender
-
-On the BBB, install the compiler and GIO/BlueZ development dependencies.
-The C++ build supports CMake 3.13+, including Buster's 3.13.4. On Buster,
-the dbus package supplies the dbus-daemon executable. Run CTest from inside
-the build directory; the newer --test-dir option is not supported there.
+On the BBB (CMake 3.13+, including Buster's 3.13.4):
 
 ~~~bash
-sudo apt-get update
 sudo apt-get install bluez libglib2.0-dev pkg-config cmake make g++ dbus
 cmake -S H_Robotics_Files -B H_Robotics_Files/build-ble -DCMAKE_BUILD_TYPE=Release
 cmake --build H_Robotics_Files/build-ble -j2
 (cd H_Robotics_Files/build-ble && ctest --output-on-failure)
+H_Robotics_Files/build-ble/neuroexo_ble_trial --address AA:BB:CC:DD:EE:FF --monitor --duration 5
+H_Robotics_Files/build-ble/neuroexo_ble_trial --address AA:BB:CC:DD:EE:FF \
+  --mode assistive --speed medium --target 45 --time-limit 60 --trials 1 --trace
 ~~~
 
-The standalone target does not require the missing EEG/IMU application modules:
+The `neuroexo_ble` library contains:
 
-~~~bash
-H_Robotics_Files/build-ble/neuroexo_ble_trial \
-  --address AA:BB:CC:DD:EE:FF --trials 20 --duration 2 \
-  --period-ms 40 --start 0 --target 60 --assistance 30 --max-position 90
-~~~
+- `ble/BleJointClient.cpp`: keepalive, telemetry, and the stop rules.
+- `ble/BluezGatt.cpp`: BlueZ GATT access over D-Bus/GIO.
+- `firmware/commProtocol/commProtocol.cpp`: the codec.
 
-It uses the same trial protocol as Python. The displayed a/b/c integers follow
-the mapping below. It reports position in degrees and marks simulated replies.
-
-To integrate with the original application, link it to the neuroexo_ble CMake
-library (ble/BleTrialClient.cpp, ble/BluezGatt.cpp, GIO, and Threads). The full acquisition
-application still requires the missing IMU, channel, FIR filter, H-infinity,
-global-variable, calibration, and SVM implementations. The independent BLE
-executable is provided so communication can be tested before restoring those.
-
-Example of the new Hardware_Interface API:
+The Hardware_Interface API:
 
 ~~~cpp
 Hardware_Interface hardware;
-hardware.setBluetoothDevice("AA:BB:CC:DD:EE:FF");
-hardware.calibrateArm();
-hardware.setMaxPosition(90.0);
-neuroexo::TrialSettings trial{1, 60.0, 0.0, 30.0}; // id, target, start, velocity
-auto timing = hardware.runArmTrial(trial, std::chrono::seconds(2));
+hardware.setBluetoothDevice("AA:BB:CC:DD:EE:FF");   // or NEUROEXO_NANO_ADDRESS in main.cpp
+hardware.debugArm();                                 // read-only: prints one telemetry frame
+neuroexo::JointCommand command{NeuroExoProtocol::Mode::Assistive,
+                               NeuroExoProtocol::Speed::Medium, 45};
+// Blocks until TargetReached (or throws after the 60 s limit), then the joint idles.
+auto result = hardware.runArmTrial(command, std::chrono::seconds(60),
+    [](const neuroexo::JointTelemetry& t) { /* angleDeg, milliAmps, status */ });
 hardware.disconnectBluetooth();
 ~~~
 
-runArmTrial blocks the calling arm-control thread and polls every 40 ms.
-Run EEG acquisition on its own thread/object lifecycle as appropriate to the
-complete application. Do not call arm-control methods concurrently.
-Individual configureTrial(), startTrial(), readArmPosition(), and endTrial()
-methods are also available for the SVM/therapy state machine.
-lastArmPositionDegrees() is an atomic cached position for other threads.
+`runArmTrial()` blocks the calling arm-control thread. Do not call arm methods
+concurrently. `lastArmPositionDegrees()` is an atomic cached angle that other
+threads can read. To issue commands yourself, call `sendArmCommand()` and
+repeat it within 250 ms. Read telemetry with `takeArmTelemetry()`.
 
-Arm_setup(maxPosition) now takes a caller-supplied positive limit in degrees;
-it does not detect a real maximum. The missing calibration/testing modules must
-be migrated from their old TCP helper calls to this typed API. main.cpp accepts
-NEUROEXO_NANO_ADDRESS for its hardware objects; it does not reconstruct the
-missing trial modules automatically.
+`Arm_setup()` now only confirms that telemetry arrives, because the protocol
+has no calibration or limit command. The removed calls (`calibrateArm`,
+`setMaxPosition`, `configureTrial`, `startTrial`, `readArmPosition`,
+`endTrial`) have no equivalent. The missing calibration and testing modules
+need to move to `runArmTrial()` or `sendArmCommand()`.
 
-## Wire specification (proposed version 1)
-
-This is an application protocol we defined from the diagram, not a Bluetooth
-SIG standard and not the old I2C packet format. All values are little-endian.
-Each complete command or reply occupies one 20-byte characteristic value.
-
-| Byte offset | Size | Field |
-|---|---:|---|
-| 0 | 1 | Magic 0x4e |
-| 1 | 1 | Version 1 |
-| 2 | 1 | Message kind |
-| 3 | 1 | Flags: 0 for commands; bit 0 means simulated in replies |
-| 4 | 2 | Command sequence (uint16) |
-| 6 | 2 | Trial ID (uint16); 0 for session-level commands |
-| 8 | 4 | a (int32) |
-| 12 | 4 | b (int32) |
-| 16 | 4 | c (int32) |
-
-| Kind | Name | a | b | c |
-|---|---|---|---|---|
-| 1 | CALIBRATE | 0 | 0 | 0 |
-| 2 | SET_MAX | Maximum position | 0 | 0 |
-| 3 | CONFIGURE | Target position | Starting position | Assistance velocity |
-| 4 | GET_POSITION | 0 | 0 | 0 |
-| 5 | START | 0 | 0 | 0 |
-| 6 | END | 0 | 0 | 0 |
-| 128 | ACK | Command kind | Status | Receiver state |
-| 129 | POSITION | Position | Device milliseconds, uint32 bit pattern | Receiver state |
-| 130 | INFO | Scale (1000) | Watchdog milliseconds (2000) | Receiver state |
-
-Position is in milli-degrees and velocity in milli-degrees/second. Thus 60000
-means 60 degrees. These are **proposed simulation units**; physical units,
-ranges, polarity, homing behavior, and controller conversion remain to be
-confirmed. The simulator accepts positions 0..maximum, maximum up to 360 degrees,
-and positive velocity up to 360 degrees/second. Those are format bounds, not
-validated limits for a real arm.
-
-ACK status: 0 OK, 1 BAD_STATE, 2 RANGE, 3 WRONG_TRIAL, 4 BAD_SEQUENCE,
-5 UNSUPPORTED. Receiver state: 0 BOOT, 1 IDLE, 2 READY, 3 RUNNING, 4 ENDED,
-5 FAULT. A POSITION response itself acknowledges GET_POSITION.
-
-Sequences begin at 1 on each connection and wrap 65535 → 1. Replies echo both
-sequence and trial. An exact retransmission of the most recent command returns
-its cached reply without repeating the action. Reusing its sequence with other
-bytes or skipping a sequence is rejected. The clients do not automatically
-retry commands. Accepted-frame sequence tracking is also advanced for command
-rejections, allowing a subsequent valid command or End.
-
-Malformed lengths, magic/version/flags, and sequence zero are ignored by the
-Nano and therefore cause a client timeout. These are binary values: do not use
-toInt(), text concatenation, or the old 200 ms quiet-time delimiter.
-
-The simulator resets its session on connect/disconnect. During RUNNING, more
-than 2000 ms without a successful new command changes it to FAULT. Cached
-duplicates do not refresh that timer. End cannot clear FAULT; recalibration or
-a new connection is required. This watchdog currently stops simulated motion.
-
-GATT UUIDs (all share suffix -6a2b-4f10-9c31-8b674045a901):
-
-| Prefix | Use | Properties |
-|---|---|---|
-| b7e20000 | Service | — |
-| b7e20001 | Command | Write with response |
-| b7e20002 | Application reply | Notify |
-| b7e20003 | Protocol information | Read |
-
-Twenty bytes fit the minimum ATT payload. Larger EEG batches belong to a
-separate stream; do not put them into these command fields. The existing
-benchmark has different UUIDs and framing and cannot use this receiver.
-
-## What remains before real arm control
-
-The earlier Nano sketch only specifies an I2C transaction to address 0x08:
-opcode 0x01 followed by a big-endian uint16 angle. It does not define actual
-calibration, velocity control, End/stop, or position readback.
-
-The supplied receiver completely parses the proposed BLE protocol but its
-CALIBRATE and CONFIGURE operate on virtual state; CONFIGURE places the simulated
-arm at the start instantly. A real receiver must replace those operations with
-a controller adapter, report readiness only after positioning finishes, return
-encoder measurements, and stop the controller on End/disconnect/watchdog.
-The BLE message IDs are not automatically the I2C opcodes.
-
-Do not interpret simulated acceptance as successful physical actuation.
-No physical arm motion, Nano upload, or live BBB radio timing was tested here.
-
-## Verification and sources
+## Verification
 
 ~~~bash
 python3 -m unittest discover -s H_Robotics_Files/tests -v
 ~~~
 
-Python tests send real encoded values into the actual C++ Nano parser, including
-all 20 trials, illegal states, bounds, duplicates, sequence wrap, timer wrap,
-watchdog faults, and client timeouts. The BlueZ integration test runs the real
-C++ D-Bus client against an isolated org.bluez service with the Nano parser.
-It covers discovery, characteristic flags, notifications arriving before the
-ATT write completes, the trial flow, failures, and cleanup.
+- **Python codec and simulator.** The Python tests compile the vendored
+  firmware codec and compare the Python codec against it: CRC, encoders,
+  thousands of corrupted frames, and the documented examples. They also test
+  the simulator's timeout, fault, and restart rules, and the session's
+  keepalive, stop-confirmation, and abort paths.
+- **C++ BlueZ client.** `bluez_integration` (CTest) runs the real BlueZ client
+  against an isolated fake `org.bluez` service. The fake publishes 50 Hz
+  telemetry and models the 250 ms timeout. It covers discovery, characteristic
+  flags, a keepalive trial with stop confirmation, both write types, CRC
+  rejection, SafetyFault, CommandTimeout, telemetry loss, and disconnect.
 
-The hardware-interface compile/logic check uses clearly marked test substitutes
-in tests/hardware_stubs for missing drivers and filters. It verifies compilation,
-24-bit conversion, gain selection, and persistence of filter objects; it does
-not validate the real amplifier, IMU, filter algorithms, or SVM.
+Not yet tested: real BLE radio timing on the BBB, the Nano/Teensy firmware on
+hardware, and any physical motion.
 
 API references:
-- [BlueZ GATT API](https://bluez.readthedocs.io/en/latest/gatt-api/)
-- [BlueZ Device API](https://bluez.readthedocs.io/en/latest/device-api/)
-- [Bleak Linux/BlueZ backend](https://bleak.readthedocs.io/en/latest/backends/linux.html)
-- [Bleak client write/notification API](https://bleak.readthedocs.io/en/latest/api/client.html)
+[BlueZ GATT API](https://bluez.readthedocs.io/en/latest/gatt-api/),
+[BlueZ Device API](https://bluez.readthedocs.io/en/latest/device-api/),
+[Bleak client API](https://bleak.readthedocs.io/en/latest/api/client.html).
 
-To reproduce that isolated hardware-class check, install libeigen3-dev and configure
-CMake with -DNEUROEXO_TEST_SENSOR_STUBS=ON, then build and run CTest. Never use
-tests/hardware_stubs as production sensor drivers.
+The hardware-interface compile check uses the test-only substitutes in
+tests/hardware_stubs. To run it, install libeigen3-dev and configure CMake
+with -DNEUROEXO_TEST_SENSOR_STUBS=ON. Never use tests/hardware_stubs as
+production sensor drivers.

@@ -5,7 +5,7 @@
 #include <array>
 #include <memory>
 #include <functional>
-#include "../ble/BleTrialClient.hpp"
+#include "../ble/BleJointClient.hpp"
 #include <string>
 #include <list>
 #include <linux/spi/spidev.h>
@@ -81,7 +81,8 @@ public:
     void setAmpEog(int amplification);
     int getAmpEog();
     void testEegStream(int fd, spi_ioc_transfer *transfer);
-    // Arm setup
+    // Arm setup: verifies telemetry arrives. The 180C protocol has no
+    // calibration or limit command, so maxPosition is not sent.
     void Arm_setup(double &maxPosition);
     // Debug arm
     void debugArm();
@@ -100,22 +101,20 @@ public:
     void testAmp();
     void toVoltage(uint8_t number[]);
 
-    // BlueZ BLE GATT trial protocol. Use one owner thread for arm operations.
+    // BLE link to the Nano 33 BLE bridge (service 180C), which relays control
+    // frames to the Teensy over I2C. Use one owner thread for arm operations.
     void setBluetoothDevice(const std::string& address, const std::string& adapter = "hci0");
     bool connectToBluetoothDevice();
     void disconnectBluetooth();
     bool isBluetoothConnected() const;
-    bool isBluetoothSimulated() const;
-    void calibrateArm();
-    void setMaxPosition(double degrees);
-    void configureTrial(const neuroexo::TrialSettings& settings);
-    void startTrial(uint16_t trial);
-    neuroexo::ArmPosition readArmPosition(uint16_t trial);
-    void endTrial(uint16_t trial);
-    double lastArmPositionDegrees() const { return double(armPositionMilliDegrees_.load()) / neuroexo::SCALE; }
-    neuroexo::TrialTiming runArmTrial(
-        const neuroexo::TrialSettings& settings, std::chrono::milliseconds duration,
-        std::function<void(const neuroexo::ArmPosition&)> onPosition = {},
+    // One control frame. Motion stops unless a frame follows within 250 ms.
+    void sendArmCommand(const neuroexo::JointCommand& command);
+    std::vector<neuroexo::JointTelemetry> takeArmTelemetry();
+    double lastArmPositionDegrees() const { return armPositionDegrees_.load(); }
+    // Start signal + keepalives until the Teensy reports TargetReached, then idle.
+    neuroexo::TrialResult runArmTrial(
+        const neuroexo::JointCommand& command, std::chrono::milliseconds timeLimit,
+        std::function<void(const neuroexo::JointTelemetry&)> onTelemetry = {},
         std::function<bool()> shouldStop = {});
 
     // Enter debug mode (used when not connected to ARM)
@@ -127,10 +126,11 @@ public:
 private:
     void requireBluetooth();
     void logEEGEOG(const MatrixXd& values);
-    std::unique_ptr<neuroexo::BleTrialClient> ble_;
+    void recordTelemetry(const neuroexo::JointTelemetry& telemetry);
+    std::unique_ptr<neuroexo::BleJointClient> ble_;
     std::string btAddress;
     std::string btAdapter = "hci0";
-    std::atomic<int32_t> armPositionMilliDegrees_{0};
+    std::atomic<double> armPositionDegrees_{0.0};
     std::array<std::unique_ptr<Filter>, 8> highPassFilters_, lowPassFilters_;
     double highPassCutoff_ = -1.0;
     bool debug = false;

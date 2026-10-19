@@ -155,12 +155,12 @@ submitted sizes. received_payload_bytes and received_min_bytes/max_bytes come
 from the Nano. Goodput uses the actual number of CRC-valid payload bytes the
 Nano received.
 
-Your existing **180C / 2A56 angle firmware is not this benchmark receiver**.
-It waits for 200 ms of silence, parses the accumulated string as an angle,
-and forwards it over I2C. It neither understands these EEG records nor returns
-delivery counters. The benchmark connects only to its separate custom service;
-it does not send test records into the angle/I2C command path. The receiver
-sketch must be compiled and uploaded for this benchmark to operate.
+The **NeuroExo bridge firmware (Nano33BLEFirmware, service 180C) is not this
+benchmark receiver**. It accepts only framed control messages
+([NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md)) and returns no delivery counters.
+The benchmark connects only to its separate custom service; it never writes
+test records to the 2A56 command characteristic. The receiver sketch must be
+compiled and uploaded for this benchmark to operate.
 
 **What this model cannot establish**
 
