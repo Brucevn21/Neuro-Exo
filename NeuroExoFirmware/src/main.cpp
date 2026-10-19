@@ -59,7 +59,7 @@ IntervalTimer motorControlTimer;
 
 volatile bool motorMotionActive = false;
 unsigned long lastDebugTime = 0;
-const unsigned long DEBUG_INTERVAL_MS = 500;
+const unsigned long DEBUG_INTERVAL_MS = 2000;
 
 // Speed setting controls both trajectory duration (interpCycles) and the
 // fraction of the controller's max current that may be commanded.
