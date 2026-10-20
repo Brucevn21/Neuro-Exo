@@ -122,9 +122,10 @@ that keeps responding with an old but valid frame.
 - [Hardware interface](Hardware_Interface.hpp): `sendMotorControl`, `stopMotor`,
   `readMotorTelemetry`, `latestMotorTelemetry`, `lastArmPositionDegrees`
 
-The supplied Teensy protocol is the compatibility reference. The older SPI
-projects elsewhere in this checkout do not implement it and were not substituted
-for the running Teensy controller. Use the Teensy firmware that implements the
-specified I2C protocol, watchdog, and safety flags.
+The supplied Teensy protocol is the compatibility reference. The Teensy
+`NeuroExoFirmware/src/main.cpp` imported from `main` still accepts the legacy
+three-byte `0x01` angle command and has no I2C telemetry response. It is not yet
+compatible with the framed bridge. Use the separately supplied Teensy firmware
+that implements the specified I2C protocol, watchdog, and safety flags.
 
 For setup, commands, and checks, see [the reader procedure](BEAGLEBONE_READER_PROCEDURE.md).

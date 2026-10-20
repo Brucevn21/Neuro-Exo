@@ -1,8 +1,10 @@
 # BeagleBone motor control and telemetry
 
 Use the updated Nano bridge with the Teensy I2C firmware described in
-[NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md). The legacy SPI sketches elsewhere
-in the repository are incompatible with this path.
+[NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md). The Teensy `src/main.cpp` imported
+from `main` still uses the legacy three-byte angle command and does not provide
+I2C telemetry. Use your separately supplied framed-protocol Teensy firmware for
+this path; building the repository's `teensy41` environment does not provide it.
 
 ## Nano
 
