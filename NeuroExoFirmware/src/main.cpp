@@ -96,6 +96,7 @@ const float VELOCITY_FILTER_ALPHA = 0.2f;
 const float ACCEL_FILTER_ALPHA = 0.1f;
 unsigned long lastStreamTime = 0;
 const unsigned long STREAM_INTERVAL_MS = 20; // 50 Hz feed for the live visualizer
+const bool STREAM_JOINT_CSV = false;          // true to feed the live visualizer
 
 // ESCON analog out 1: 0 V = -7 A, 1.65 V = 0 A, 3.3 V = +7 A.
 const float CURRENT_SENSOR_ZERO_V = 1.65f;
@@ -259,13 +260,24 @@ void processI2CCommand() {
     NeuroExoProtocol::ControlPacket packet;
     if (!parser.takeFrame(frame) || !NeuroExoProtocol::decodeControlFrame(frame, packet)) {
         invalidCommand = true;
+        Serial.print("[Teensy] Invalid command frame (");
+        Serial.print(localLength);
+        Serial.println(" bytes)");
         return;
     }
+
+    Serial.print("[Teensy] Command received - Target: ");
+    Serial.print(packet.targetAngleDeg);
+    Serial.print(" deg | Mode: ");
+    Serial.print((int)packet.mode);
+    Serial.print(" | Speed: ");
+    Serial.println((int)packet.speed);
 
     invalidCommand = false;
     lastValidCommandTime = millis();
     commandTimedOut = false;
     if (safetyEstopLatched) {
+        Serial.println("[Teensy] Ignored: safety E-stop latched");
         return;
     }
     lastCommandedMode = packet.mode;
@@ -397,7 +409,7 @@ void loop() {
     updateTelemetryFrame();
 
     // Compact CSV line consumed by the Python live joint visualizer.
-    if (currentTime - lastStreamTime >= STREAM_INTERVAL_MS) {
+    if (STREAM_JOINT_CSV && currentTime - lastStreamTime >= STREAM_INTERVAL_MS) {
         lastStreamTime = currentTime;
         Serial.print("JOINT,");
         Serial.print(encDeg, 2);
