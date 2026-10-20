@@ -1,4 +1,4 @@
-#include "BleTrialClient.hpp"
+#include "BleMotorClient.hpp"
 #include <gio/gio.h>
 #include <algorithm>
 #include <cctype>
@@ -10,10 +10,6 @@
 
 namespace neuroexo {
 namespace {
-constexpr const char* SERVICE_UUID = "b7e20000-6a2b-4f10-9c31-8b674045a901";
-constexpr const char* COMMAND_UUID = "b7e20001-6a2b-4f10-9c31-8b674045a901";
-constexpr const char* EVENT_UUID = "b7e20002-6a2b-4f10-9c31-8b674045a901";
-constexpr const char* INFO_UUID = "b7e20003-6a2b-4f10-9c31-8b674045a901";
 using Variant = std::unique_ptr<GVariant, decltype(&g_variant_unref)>;
 Variant own(GVariant* value) { return Variant(value, g_variant_unref); }
 
@@ -47,15 +43,6 @@ std::string normalizeAddress(std::string address) {
   }
   return address;
 }
-Packet valueBytes(GVariant* array) {
-  gsize length = 0;
-  const auto* data = static_cast<const uint8_t*>(g_variant_get_fixed_array(array, &length, 1));
-  if (length != 20) throw std::runtime_error("Nano GATT value must contain exactly 20 bytes");
-  Packet value{};
-  std::copy(data, data + 20, value.begin());
-  return value;
-}
-
 class BluezGatt final : public GattTransport {
  public:
   explicit BluezGatt(std::string testBus = {}) : testBus_(std::move(testBus)) {}
@@ -124,7 +111,7 @@ class BluezGatt final : public GattTransport {
       closedHandler_ = g_signal_connect(bus_, "closed", G_CALLBACK(busClosed), this);
       {
         std::lock_guard<std::mutex> guard(replyMutex_);
-        failure_.clear(); pending_ = ready_ = false;
+        failure_.clear(); latest_.reset(); unread_ = false; online_ = true;
       }
       worker_ = std::thread([this] {
         g_main_context_push_thread_default(context_);
@@ -140,54 +127,59 @@ class BluezGatt final : public GattTransport {
     }
   }
 
-  Packet info() override {
-    std::lock_guard<std::mutex> guard(operationMutex_);
-    if (!bus_ || info_.empty()) throw std::runtime_error("BLE is not connected");
-    GVariantBuilder options;
-    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    auto result = call(info_, "org.bluez.GattCharacteristic1", "ReadValue",
-                       g_variant_new("(a{sv})", &options));
-    auto bytes = own(g_variant_get_child_value(result.get(), 0));
-    return valueBytes(bytes.get());
+  bool connected() const override {
+    std::lock_guard<std::mutex> guard(replyMutex_);
+    return online_ && failure_.empty();
   }
 
-  Packet exchange(const Packet& request, int timeoutMs) override {
+  void writeControl(const ControlPacket& request, int timeoutMs) override {
     std::lock_guard<std::mutex> operation(operationMutex_);
-    Frame frame;
-    if (!decode(request.data(), request.size(), frame)) throw std::invalid_argument("invalid request");
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    Control command;
+    if (!decodeControl(request.data(), request.size(), command))
+      throw std::invalid_argument("invalid control frame");
     {
       std::lock_guard<std::mutex> guard(replyMutex_);
       if (!failure_.empty()) throw std::runtime_error(failure_);
-      if (!bus_ || !notifying_) throw std::runtime_error("BLE is not connected");
-      expectedSequence_ = frame.sequence; expectedTrial_ = frame.trial;
-      pending_ = true; ready_ = false;
+      if (!online_) throw std::runtime_error("BLE is not connected");
     }
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(&options, "{sv}", "type", g_variant_new_string("request"));
+    auto* bytes = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, request.data(), request.size(), 1);
     try {
-      GVariantBuilder options;
-      g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-      g_variant_builder_add(&options, "{sv}", "type", g_variant_new_string("request"));
-      auto* bytes = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, request.data(), request.size(), 1);
       call(command_, "org.bluez.GattCharacteristic1", "WriteValue",
            g_variant_new("(@aya{sv})", bytes, &options), timeoutMs);
-      std::unique_lock<std::mutex> guard(replyMutex_);
-      if (!replyCondition_.wait_until(guard, deadline,
-            [this] { return ready_ || !failure_.empty(); })) {
-        pending_ = false;
-        throw std::runtime_error("timed out waiting for Nano application reply");
-      }
-      pending_ = false;
-      if (!failure_.empty()) throw std::runtime_error(failure_);
-      return reply_;
     } catch (...) {
-      std::lock_guard<std::mutex> guard(replyMutex_);
-      pending_ = false;
+      failed("Control write failed; outcome unknown, reconnect explicitly before sending again");
       throw;
     }
   }
 
+  std::optional<TelemetryUpdate> receiveTelemetry(int timeoutMs) override {
+    std::unique_lock<std::mutex> guard(replyMutex_);
+    replyCondition_.wait_for(guard, std::chrono::milliseconds(timeoutMs),
+                            [this] { return unread_ || !failure_.empty() || !online_; });
+    if (!failure_.empty()) throw std::runtime_error(failure_);
+    if (!online_) throw std::runtime_error("Nano is disconnected");
+    if (!unread_) return std::nullopt;
+    unread_ = false;
+    return latest_;
+  }
+
+  std::optional<TelemetryUpdate> latestTelemetry() const override {
+    std::lock_guard<std::mutex> guard(replyMutex_);
+    if (!failure_.empty()) throw std::runtime_error(failure_);
+    if (!online_) return std::nullopt;
+    return latest_;
+  }
+
   void disconnect() noexcept override {
     std::lock_guard<std::mutex> operation(operationMutex_);
+    {
+      std::lock_guard<std::mutex> guard(replyMutex_);
+      online_ = false; unread_ = false; latest_.reset();
+      replyCondition_.notify_all();
+    }
     if (notifying_) bestEffort(event_, "org.bluez.GattCharacteristic1", "StopNotify");
     notifying_ = false;
     if (ownsDevice_) bestEffort(device_, "org.bluez.Device1", "Disconnect");
@@ -211,7 +203,7 @@ class BluezGatt final : public GattTransport {
     if (context_) g_main_context_unref(context_);
     bus_ = nullptr; loop_ = nullptr; context_ = nullptr; closedHandler_ = 0;
     eventSubscription_ = deviceSubscription_ = ownerSubscription_ = 0;
-    adapter_.clear(); device_.clear(); command_.clear(); event_.clear(); info_.clear();
+    adapter_.clear(); device_.clear(); command_.clear(); event_.clear();
   }
 
  private:
@@ -264,26 +256,25 @@ class BluezGatt final : public GattTransport {
     std::string service;
     objects("org.bluez.GattService1", [&](const std::string& path, GVariant* p) {
       if (stringProperty(p, "Device") == device_ && stringProperty(p, "UUID") == SERVICE_UUID) {
-        if (!service.empty()) throw std::runtime_error("ambiguous Nano trial service");
+        if (!service.empty()) throw std::runtime_error("ambiguous Nano motor service");
         service = path;
       }
     });
-    if (service.empty()) throw std::runtime_error("Nano trial service missing; the old angle sketch is incompatible");
+    if (service.empty()) throw std::runtime_error("Nano motor service missing; flash NeuroExoFirmware with the nano33ble environment");
     objects("org.bluez.GattCharacteristic1", [&](const std::string& path, GVariant* p) {
       if (stringProperty(p, "Service") != service) return;
       const std::string uuid = stringProperty(p, "UUID");
       std::string* destination = nullptr;
       const char* property = nullptr;
       if (uuid == COMMAND_UUID) { destination = &command_; property = "write"; }
-      if (uuid == EVENT_UUID) { destination = &event_; property = "notify"; }
-      if (uuid == INFO_UUID) { destination = &info_; property = "read"; }
+      if (uuid == TELEMETRY_UUID) { destination = &event_; property = "notify"; }
       if (destination) {
         if (!destination->empty() || !flag(p, property))
           throw std::runtime_error("Nano characteristic flags or uniqueness mismatch");
         *destination = path;
       }
     });
-    if (command_.empty() || event_.empty() || info_.empty())
+    if (command_.empty() || event_.empty())
       throw std::runtime_error("Nano protocol characteristics missing");
   }
   void failed(const std::string& reason) {
@@ -317,34 +308,31 @@ class BluezGatt final : public GattTransport {
       }
       auto value = own(g_variant_lookup_value(properties, "Value", G_VARIANT_TYPE("ay")));
       if (!value) return;
-      const Packet bytes = valueBytes(value.get());
-      Frame frame;
-      if (!decode(bytes.data(), bytes.size(), frame))
-        throw std::runtime_error("malformed Nano notification");
+      gsize length = 0;
+      const auto* raw = static_cast<const uint8_t*>(g_variant_get_fixed_array(value.get(), &length, 1));
+      Telemetry telemetry;
+      // Discard corrupt, truncated, oversized, or wrong-direction notifications.
+      // Invalid frames do not refresh the timestamp or overwrite valid feedback.
+      if (!decodeTelemetry(raw, length, telemetry)) return;
       std::lock_guard<std::mutex> guard(self->replyMutex_);
-      if (!self->pending_) return;
-      if (frame.sequence != self->expectedSequence_ || frame.trial != self->expectedTrial_) {
-        self->failure_ = "unexpected Nano reply sequence/trial";
-      } else if (self->ready_) {
-        self->failure_ = "duplicate Nano reply";
-      } else {
-        self->reply_ = bytes; self->ready_ = true;
-      }
+      if (!self->online_) return;
+      self->latest_ = TelemetryUpdate{telemetry, std::chrono::steady_clock::now()};
+      self->unread_ = true;
       self->replyCondition_.notify_all();
     } catch (const std::exception& error) { self->failed(error.what()); }
   }
 
-  std::string testBus_, adapter_, device_, command_, event_, info_, failure_;
+  std::string testBus_, adapter_, device_, command_, event_, failure_;
   GDBusConnection* bus_ = nullptr;
   GMainContext* context_ = nullptr;
   GMainLoop* loop_ = nullptr;
   std::thread worker_;
   guint eventSubscription_ = 0, deviceSubscription_ = 0, ownerSubscription_ = 0;
   gulong closedHandler_ = 0;
-  bool ownsDevice_ = false, notifying_ = false, pending_ = false, ready_ = false;
-  uint16_t expectedSequence_ = 0, expectedTrial_ = 0;
-  Packet reply_{};
-  std::mutex operationMutex_, replyMutex_;
+  bool ownsDevice_ = false, notifying_ = false, online_ = false, unread_ = false;
+  std::optional<TelemetryUpdate> latest_;
+  std::mutex operationMutex_;
+  mutable std::mutex replyMutex_;
   std::condition_variable replyCondition_;
 };
 }  // namespace

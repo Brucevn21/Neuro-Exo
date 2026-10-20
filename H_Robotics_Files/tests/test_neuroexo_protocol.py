@@ -1,227 +1,210 @@
-"""Cross-language protocol tests using the exact Nano receiver core."""
+"""Wire compatibility and independent BLE TX/RX behavior; no hardware needed."""
 import argparse
 import asyncio
 import contextlib
 import ctypes
 import io
-import json
-import pathlib
+from pathlib import Path
 import random
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import neuroexo_protocol as p
-import neuroexo_trial as cli
-
-BUILD = None
-NATIVE = None
+import neuroexo_motor as cli
 
 
-def setUpModule():
-    global BUILD, NATIVE
-    BUILD = tempfile.TemporaryDirectory(prefix="neuroexo-trial-")
-    library = pathlib.Path(BUILD.name) / "trial.so"
-    subprocess.run(["g++", "-std=c++11", "-Wall", "-Wextra", "-Werror", "-shared",
-                    "-fPIC", "-O2", str(ROOT / "tests/trial_bridge.cpp"), "-o", str(library)],
-                   check=True)
-    NATIVE = ctypes.CDLL(str(library))
-    NATIVE.trial_receive.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p]
-    NATIVE.trial_receive.restype = ctypes.c_int
-    NATIVE.trial_tick.argtypes = [ctypes.c_uint32]
+class CodecTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.build = tempfile.TemporaryDirectory(prefix="neuroexo-protocol-")
+        library = Path(cls.build.name) / "protocol.so"
+        subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
+                        str(ROOT / "tests/protocol_bridge.cpp"),
+                        str(ROOT.parent / "NeuroExoFirmware/src/commProtocol.cpp"), "-o", str(library)], check=True)
+        cls.native = ctypes.CDLL(str(library))
+        for prefix in ("control", "telemetry"):
+            getattr(cls.native, prefix + "_decode").argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
 
+    @classmethod
+    def tearDownClass(cls):
+        cls.build.cleanup()
 
-def tearDownModule():
-    BUILD.cleanup()
+    def compare(self, frame):
+        raw = frame.encode()
+        out = ctypes.create_string_buffer(len(raw))
+        values = (ctypes.c_int * 3)()
+        if isinstance(frame, p.Control):
+            self.assertEqual(self.native.control_encode(int(frame.mode), int(frame.speed), frame.target_angle_deg, out), 1)
+            self.assertEqual(self.native.control_decode(raw, len(raw), values), 1)
+            self.assertEqual(list(values), [frame.mode, frame.speed, frame.target_angle_deg])
+        else:
+            self.native.telemetry_encode(frame.current_angle_deg, frame.current_milliamps, int(frame.status), out)
+            self.assertEqual(self.native.telemetry_decode(raw, len(raw), values), 1)
+            self.assertEqual(list(values), [frame.current_angle_deg, frame.current_milliamps, frame.status])
+        self.assertEqual(raw, out.raw)
+        self.assertEqual(p.decode(raw), frame)
 
+    def test_crc_and_reference_examples(self):
+        self.assertEqual(p.crc8(b"123456789"), 0xf4)
+        control = p.Control(p.Mode.Assistive, p.Speed.High, -123)
+        telemetry = p.Telemetry(45, 1200, p.Status.MotionActive)
+        # README originally used AA and 14: these contradict the supplied C++ CRC.
+        self.assertEqual(control.encode().hex(), "0210040102ff859403")
+        self.assertEqual(telemetry.encode().hex(), "021105002d04b0015203")
+        self.compare(control)
+        self.compare(telemetry)
 
-def args(*extra):
-    parser = argparse.ArgumentParser()
-    cli.add_modes(parser.add_subparsers(dest="mode", required=True))
-    return parser.parse_args(["protocol-demo", "--duration", "0.16", *extra])
+    def test_signed_boundaries_and_all_flags(self):
+        for number in (-32768, -123, -1, 0, 2, 3, 45, 32767):
+            for mode in p.Mode:
+                for speed in p.Speed:
+                    self.compare(p.Control(mode, speed, number))
+            for status in range(256):
+                self.compare(p.Telemetry(number, number, p.Status(status)))
 
-
-class ProtocolTests(unittest.TestCase):
-    def setUp(self):
-        self.model = p.SimulatedNano()
-        NATIVE.trial_reset()
-        self.seq = 0
-
-    def exchange(self, kind, trial=0, a=0, b=0, c=0, now=0):
-        self.seq = self.seq % 65535 + 1
-        raw = p.Frame(kind, self.seq, trial, a, b, c).encode()
-        self.assertEqual(len(raw), 20)
-        return self.compare(raw, now)
-
-    def compare(self, raw, now):
-        out = ctypes.create_string_buffer(20)
-        self.assertEqual(NATIVE.trial_receive(raw, len(raw), now, out), 1)
-        self.assertEqual(out.raw, self.model.process(raw, now))
-        self.assertEqual(NATIVE.trial_state(), self.model.state)
-        self.assertEqual(NATIVE.trial_position(), self.model.position)
-        return p.Frame.decode(out.raw)
-
-    def setup_trial(self, now=0, start=0, target=60000):
-        self.exchange(p.Kind.CALIBRATE, now=now)
-        self.exchange(p.Kind.SET_MAX, a=90000, now=now)
-        self.exchange(p.Kind.CONFIGURE, 1, target, start, 30000, now=now)
-
-    def test_full_twenty_trial_diagram_and_40ms_feedback(self):
-        self.exchange(p.Kind.CALIBRATE)
-        self.exchange(p.Kind.SET_MAX, a=90000)
-        now = 0
-        for trial in range(1, 21):
-            self.assertEqual(self.exchange(p.Kind.CONFIGURE, trial, 60000, 0, 30000, now).c,
-                             p.State.READY)
-            self.assertEqual(self.exchange(p.Kind.GET_POSITION, trial, now=now).a, 0)
-            self.exchange(p.Kind.START, trial, now=now)
-            for sample in range(1, 11):
-                now += 40
-                reply = self.exchange(p.Kind.GET_POSITION, trial, now=now)
-                self.assertEqual(reply.a, sample * 1200)
-                self.assertEqual(reply.c, p.State.RUNNING)
-            self.assertEqual(self.exchange(p.Kind.END, trial, now=now).c, p.State.ENDED)
-            now += 100
-
-    def test_wrong_state_trial_range_and_unused_fields(self):
-        self.assertEqual(self.exchange(p.Kind.START, 0).b, p.Status.BAD_STATE)
-        self.setup_trial()
-        self.assertEqual(self.exchange(p.Kind.START, 2).b, p.Status.WRONG_TRIAL)
-        self.assertEqual(self.exchange(p.Kind.GET_POSITION, 1, a=1).b, p.Status.RANGE)
-        self.exchange(p.Kind.START, 1)
-        self.assertEqual(self.exchange(p.Kind.CALIBRATE).b, p.Status.BAD_STATE)
-        self.exchange(p.Kind.END, 1)
-        self.assertEqual(self.exchange(p.Kind.CONFIGURE, 2, 91000, 0, 30000).b, p.Status.RANGE)
-
-    def test_duplicate_start_is_idempotent_and_conflict_rejected(self):
-        self.setup_trial()
-        self.exchange(p.Kind.START, 1)
-        raw = p.Frame(p.Kind.START, self.seq, 1).encode()
-        self.assertEqual(self.compare(raw, 40).c, p.State.RUNNING)
-        conflict = p.Frame(p.Kind.END, self.seq, 1).encode()
-        self.assertEqual(self.compare(conflict, 50).b, p.Status.BAD_SEQUENCE)
-        self.exchange(p.Kind.END, 1, now=60)
-
-    def test_watchdog_disconnect_semantics_and_timestamp_wrap(self):
-        now = 0xFFFFFFF0
-        self.setup_trial(now)
-        self.exchange(p.Kind.START, 1, now=now)
-        reply = self.exchange(p.Kind.GET_POSITION, 1, now=(now + 40) & 0xFFFFFFFF)
-        self.assertEqual(reply.a, 1200)
-        self.assertEqual(reply.b & 0xFFFFFFFF, 24)
-        self.model.tick(2025)
-        NATIVE.trial_tick(2025)
-        self.assertEqual(self.model.state, p.State.FAULT)
-        self.assertEqual(NATIVE.trial_state(), p.State.FAULT)
-        self.assertEqual(self.exchange(p.Kind.END, 1, now=2025).c, p.State.FAULT)
-        self.exchange(p.Kind.CALIBRATE, now=2025)
-        self.assertEqual(self.model.state, p.State.IDLE)
-
-    def test_motion_clamps_at_target_and_can_move_down(self):
-        self.setup_trial(start=60000, target=0)
-        self.exchange(p.Kind.START, 1)
-        for time_ms in range(1000, 5001, 1000):
-            reply = self.exchange(p.Kind.GET_POSITION, 1, now=time_ms)
-        self.assertEqual(reply.a, 0)
-        self.assertEqual(reply.c, p.State.RUNNING)  # Only End ends a trial.
-
-    def test_malformed_values_and_random_commands_match(self):
-        for raw in (b"", b"x" * 19, b"x" * 21,
-                    p.Frame(p.Kind.START, 0).encode(),
-                    p.Frame(p.Kind.START, 1, flags=1).encode()):
-            out = ctypes.create_string_buffer(20)
-            self.assertEqual(NATIVE.trial_receive(raw, len(raw), 0, out), 0)
-            with self.assertRaises(ValueError):
-                self.model.process(raw, 0)
-        rng = random.Random(31)
+    def test_random_wire_parity(self):
+        rng = random.Random(42)
         for _ in range(1000):
-            self.exchange(rng.randrange(1, 10), rng.randrange(0, 3),
-                          rng.randrange(-1, 100000), rng.randrange(-1, 100000),
-                          rng.randrange(-1, 100000), now=rng.randrange(0, 1000))
+            self.compare(p.Control(p.Mode(rng.randrange(3)), p.Speed(rng.randrange(3)), rng.randint(-32768, 32767)))
+            self.compare(p.Telemetry(rng.randint(-32768, 32767), rng.randint(-32768, 32767), p.Status(rng.randrange(256))))
 
-    def test_sequence_wrap_and_missing_command(self):
-        self.assertEqual(self.compare(p.Frame(p.Kind.CALIBRATE, 2).encode(), 0).b,
-                         p.Status.BAD_SEQUENCE)
-        for _ in range(65536):
-            self.exchange(p.Kind.GET_POSITION)
-        self.assertEqual(self.seq, 1)
+    def test_corruption_truncation_and_oversize(self):
+        for frame, native in ((p.Control(p.Mode.Neutral, p.Speed.Slow, -123), self.native.control_decode),
+                              (p.Telemetry(-123, -1200, p.Status(15)), self.native.telemetry_decode)):
+            raw = frame.encode()
+            bad = [raw[:i] for i in range(len(raw))] + [raw + b"\0", raw * 2]
+            for index in range(len(raw)):
+                for bit in range(8):
+                    mutated = bytearray(raw)
+                    mutated[index] ^= 1 << bit
+                    bad.append(bytes(mutated))
+            for value in bad:
+                with self.assertRaises(ValueError):
+                    type(frame).decode(value)
+                self.assertEqual(native(value, len(value), (ctypes.c_int * 3)()), 0)
 
-
-class ClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_demo_runs_diagram_and_logs_actual_bytes(self):
-        link = cli.DemoLink()
-        stream = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()):
-            session = cli.Session(link, link, cli.Trace(link, stream=stream, simulated=True), 1)
-            result = await session.run(args("--trials", "2"))
-        self.assertEqual(result, 0)
-        self.assertEqual(session.polls, 8)
-        self.assertEqual(link.nano.state, p.State.ENDED)
-        records = [json.loads(line) for line in stream.getvalue().splitlines()]
-        self.assertTrue(all(len(bytes.fromhex(row["hex"])) == 20 for row in records))
-        self.assertTrue(all(row["clock"] == "virtual" for row in records))
-        self.assertEqual(session.requests, session.responses)
-
-    async def test_overrun_skips_deadlines_without_catchup_burst(self):
-        class Slow(cli.DemoLink):
-            async def exchange(self, raw, timeout):
-                self.seconds += 0.060
-                return await super().exchange(raw, timeout)
-        link = Slow()
-        with contextlib.redirect_stdout(io.StringIO()):
-            session = cli.Session(link, link, cli.Trace(link), 1)
-            result = await session.run(args("--duration", ".4"))
-        self.assertEqual(result, 2)
-        self.assertGreater(session.skipped, 0)
-        self.assertEqual(link.nano.state, p.State.ENDED)
-
-    async def test_exception_attempts_end(self):
-        class Broken(cli.DemoLink):
-            async def exchange(self, raw, timeout):
-                frame = p.Frame.decode(raw)
-                if frame.kind == p.Kind.GET_POSITION and self.nano.state == p.State.RUNNING:
-                    # Process the request but lose its reply, as on a real connection.
-                    await super().exchange(raw, timeout)
-                    raise TimeoutError("lost reply")
-                return await super().exchange(raw, timeout)
-        link = Broken()
-        with contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(TimeoutError):
-                await cli.Session(link, link, cli.Trace(link), 1).run(args())
-        self.assertEqual(link.nano.state, p.State.ENDED)
-
-    async def test_ble_early_reply_and_timeout(self):
-        class Fake:
-            def __init__(self):
-                self.nano = p.SimulatedNano()
-                self.link = None
-                self.drop = False
-            async def write_gatt_char(self, uuid, raw, response):
-                self.last = (uuid, response)
-                reply = self.nano.process(raw, 0)
-                if not self.drop:
-                    self.link.notification(None, reply)
-        fake = Fake()
-        link = cli.BleLink(fake)
-        fake.link = link
-        reply = await link.exchange(p.Frame(p.Kind.CALIBRATE, 1).encode(), .1)
-        self.assertEqual(p.Frame.decode(reply).b, p.Status.OK)
-        self.assertEqual(fake.last, (p.COMMAND, True))
-        fake.drop = True
-        with self.assertRaises(asyncio.TimeoutError):
-            await link.exchange(p.Frame(p.Kind.SET_MAX, 2, a=90000).encode(), .01)
-
-    def test_cli_validation_and_log_no_overwrite(self):
-        for extra in (("--trials", "0"), ("--interval-ms", "1"),
-                      ("--target", "100"), ("--assistance", "0")):
+    def test_invalid_mode_speed_with_valid_crc(self):
+        for index in (3, 4):
+            raw = bytearray(p.Control(p.Mode.Assistive, p.Speed.High, 45).encode())
+            raw[index] = 3
+            raw[-2] = p.crc8(raw[1:-2])
             with self.assertRaises(ValueError):
-                cli.validate(args(*extra))
-        with tempfile.TemporaryDirectory() as directory:
-            path = pathlib.Path(directory) / "trace.jsonl"
-            path.write_text("keep")
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(cli.run(args("--log", str(path))), 1)
-            self.assertEqual(path.read_text(), "keep")
+                p.Control.decode(raw)
+            self.assertEqual(self.native.control_decode(bytes(raw), len(raw), (ctypes.c_int * 3)()), 0)
+        for angle in (-32769, 32768, 1.5):
+            with self.assertRaises(ValueError):
+                p.Control(p.Mode.Neutral, p.Speed.Slow, angle).encode()
+
+
+class FakeClient:
+    def __init__(self):
+        self.writes = []
+
+    async def write_gatt_char(self, uuid, raw, response):
+        assert uuid == p.COMMAND and response is True
+        self.writes.append(p.Control.decode(raw))
+
+
+def args(mode, duration=0.12):
+    return argparse.Namespace(mode=mode, duration=duration, telemetry_timeout=0.5,
+                              motor_mode="assistive", speed="high", angle=-123, period_ms=20)
+
+
+class LinkTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.link = cli.BleLink()
+        self.link.client = FakeClient()
+        self.trace = cli.Trace(stream=io.StringIO())
+
+    def feedback(self, status=p.Status.MotionActive, angle=45):
+        self.link.notification(None, p.Telemetry(angle, -1200, status).encode())
+
+    async def pump(self):
+        while True:
+            self.feedback()
+            await asyncio.sleep(0.01)
+
+    async def test_telemetry_without_any_command(self):
+        self.feedback()
+        update = await self.link.receive(0.05)
+        self.assertEqual(update[1].current_milliamps, -1200)
+        self.assertEqual(self.link.client.writes, [])
+
+    async def test_tx_does_not_wait_for_telemetry_reply(self):
+        await self.link.send(p.Control(p.Mode.Assistive, p.Speed.High, -123))
+        self.assertEqual(len(self.link.client.writes), 1)
+        self.assertTrue(self.link.queue.empty())
+
+    async def test_corruption_does_not_replace_latest_or_refresh_age(self):
+        self.feedback()
+        before = self.link.latest
+        self.link.notification(None, b"bad")
+        self.assertIs(self.link.latest, before)
+        self.assertEqual(self.link.invalid_frames, 1)
+        await self.link.receive(0.05)
+        with self.assertRaises(TimeoutError):
+            await self.link.receive(0.01)
+
+    async def test_bounded_queue_keeps_newest(self):
+        for angle in range(1000):
+            self.feedback(angle=angle)
+        self.assertEqual(self.link.queue.qsize(), 1)
+        self.assertEqual((await self.link.receive(0.05))[1].current_angle_deg, 999)
+
+    async def test_disconnect_wakes_waiter_and_discards_cache(self):
+        waiter = asyncio.create_task(self.link.receive(1))
+        await asyncio.sleep(0)
+        self.link.disconnected(None)
+        with self.assertRaises(ConnectionError):
+            await waiter
+        self.assertIsNone(self.link.latest)
+
+    async def test_monitor_never_writes(self):
+        pump = asyncio.create_task(self.pump())
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                await cli.run_connected(self.link, args("ble-monitor"), self.trace)
+            self.assertEqual(self.link.client.writes, [])
+        finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+    async def test_control_heartbeat_and_neutral_cleanup(self):
+        pump = asyncio.create_task(self.pump())
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                await cli.run_connected(self.link, args("ble-control"), self.trace)
+            self.assertGreaterEqual(len(self.link.client.writes), 3)
+            self.assertTrue(all(c.target_angle_deg == -123 for c in self.link.client.writes[:-1]))
+            self.assertEqual(self.link.client.writes[-1].mode, p.Mode.Neutral)
+        finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+    async def test_safety_fault_stops_heartbeat_without_rearming(self):
+        self.feedback()
+        async def fault():
+            await asyncio.sleep(0.03)
+            self.feedback(p.Status.SafetyFault)
+        task = asyncio.create_task(fault())
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            await cli.run_connected(self.link, args("ble-control", 1), self.trace)
+        await task
+        count = len(self.link.client.writes)
+        await asyncio.sleep(0.04)
+        self.assertEqual(len(self.link.client.writes), count)
+        self.assertTrue(all(c.mode == p.Mode.Assistive for c in self.link.client.writes))
+
+    async def test_missing_telemetry_sends_nothing(self):
+        with self.assertRaises(TimeoutError):
+            await cli.run_connected(self.link, args("ble-control"), self.trace)
+        self.assertEqual(self.link.client.writes, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

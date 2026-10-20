@@ -5,7 +5,7 @@
 #include <array>
 #include <memory>
 #include <functional>
-#include "BleTrialClient.hpp"
+#include "BleMotorClient.hpp"
 #include <string>
 #include <list>
 #include <linux/spi/spidev.h>
@@ -82,7 +82,7 @@ public:
     int getAmpEog();
     void testEegStream(int fd, spi_ioc_transfer *transfer);
     // Arm setup
-    void Arm_setup(double &maxPosition);
+    void Arm_setup();
     // Debug arm
     void debugArm();
 
@@ -100,23 +100,16 @@ public:
     void testAmp();
     void toVoltage(uint8_t number[]);
 
-    // BlueZ BLE GATT trial protocol. Use one owner thread for arm operations.
+    // Separate BLE command writes and asynchronous Teensy telemetry notifications.
     void setBluetoothDevice(const std::string& address, const std::string& adapter = "hci0");
     bool connectToBluetoothDevice();
     void disconnectBluetooth();
     bool isBluetoothConnected() const;
-    bool isBluetoothSimulated() const;
-    void calibrateArm();
-    void setMaxPosition(double degrees);
-    void configureTrial(const neuroexo::TrialSettings& settings);
-    void startTrial(uint16_t trial);
-    neuroexo::ArmPosition readArmPosition(uint16_t trial);
-    void endTrial(uint16_t trial);
-    double lastArmPositionDegrees() const { return double(armPositionMilliDegrees_.load()) / neuroexo::SCALE; }
-    neuroexo::TrialTiming runArmTrial(
-        const neuroexo::TrialSettings& settings, std::chrono::milliseconds duration,
-        std::function<void(const neuroexo::ArmPosition&)> onPosition = {},
-        std::function<bool()> shouldStop = {});
+    void sendMotorControl(neuroexo::Mode mode, neuroexo::Speed speed, int16_t targetAngleDeg);
+    void stopMotor();
+    std::optional<neuroexo::TelemetryUpdate> readMotorTelemetry(int timeoutMs = 100);
+    neuroexo::TelemetryUpdate latestMotorTelemetry(int maxAgeMs = 250) const;
+    double lastArmPositionDegrees() const;
 
     // Enter debug mode (used when not connected to ARM)
     void debugMode();
@@ -127,10 +120,9 @@ public:
 private:
     void requireBluetooth();
     void logEEGEOG(const MatrixXd& values);
-    std::unique_ptr<neuroexo::BleTrialClient> ble_;
+    std::unique_ptr<neuroexo::BleMotorClient> ble_;
     std::string btAddress;
     std::string btAdapter = "hci0";
-    std::atomic<int32_t> armPositionMilliDegrees_{0};
     std::array<std::unique_ptr<Filter>, 8> highPassFilters_, lowPassFilters_;
     double highPassCutoff_ = -1.0;
     bool debug = false;

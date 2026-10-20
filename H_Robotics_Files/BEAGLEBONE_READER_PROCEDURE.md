@@ -1,251 +1,125 @@
-> Legacy procedure: this describes the old Classic RFCOMM producer. The current
-> Hardware_Interface.cpp uses the BLE trial protocol instead. Follow
-> [NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md) for the current Nano receiver and
-> Python/C++ run commands.
+# BeagleBone motor control and telemetry
 
-This procedure receives the BeagleBone application's EEG/EOG messages with
-[`read_outputs.py`](read_outputs.py) and displays them in a terminal. It assumes
-the Classic Bluetooth transport implemented in this folder's C++ code.
+Use the updated Nano bridge with the Teensy I2C firmware described in
+[NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md). The legacy SPI sketches elsewhere
+in the repository are incompatible with this path.
 
-**What the reader displays**
+## Nano
 
-The BeagleBone sends one text record per sample:
+Connect Nano SDA/SCL and common ground to the Teensy's configured I2C bus.
+The Nano is master, and Teensy must answer at `0x08`. Build/upload from the
+repository root:
+
+```sh
+pio run -d NeuroExoFirmware -e nano33ble
+pio run -d NeuroExoFirmware -e nano33ble -t upload
+```
+
+The Nano entry point is `NeuroExoFirmware/src/nanoBridge.cpp`. The shared codec
+lives alongside it in `commProtocol.cpp` and `commProtocol.h`. PlatformIO selects
+these files for the `nano33ble` environment and installs ArduinoBLE automatically.
+Serial diagnostics use 115200 baud. The bridge does not wait for USB Serial.
+
+## Python on the BeagleBone
+
+```sh
+cd H_Robotics_Files
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements-ble.txt
+bluetoothctl power on
+python3 read_outputs.py ble-scan
+python3 read_outputs.py ble-monitor --address AA:BB:CC:DD:EE:FF --hex
+```
+
+Replace the address with the Nano's scan result. Monitoring only subscribes to
+telemetry. It sends no motor commands. Expect output like:
 
 ```text
-eeg1;eeg2;eeg3;eeg4;eeg5;eog1;eog2;eog3\n
+    0.040s RX angle=45 deg current=1200 mA status=0x01 MotionActive=1 CommandTimeout=0 InvalidCommand=0 SafetyFault=0
 ```
 
-The eight fields are numeric values; `\n` represents the terminating newline.
-For example, this synthetic message:
+To send controls while displaying the independent telemetry stream:
 
-```text
-1;2;3;4;5;6;7;8
+```sh
+python3 read_outputs.py ble-control --address AA:BB:CC:DD:EE:FF \
+  --mode assistive --speed slow --angle 30 --duration 5 --period-ms 100 --hex
 ```
 
-appears as:
+This sends actual motor controls, with degrees and speed interpreted by your
+Teensy controller. All three control fields and a positive duration are required.
+The wire supports −32768..32767 degrees; this is an encoding range, not a
+mechanical travel limit. The Teensy remains responsible for configured limits.
+`neutral` is mode 2. At completion or Ctrl+C, the control tool attempts Neutral.
 
-```text
-2026-09-22T12:00:00.000 [EEG/EOG] eeg1=1  eeg2=2  eeg3=3  eeg4=4  eeg5=5  eog1=6  eog2=7  eog3=8
+Add `--log motor-session.jsonl` to either mode to write a new JSONL file of decoded
+values and raw hex. Existing files are not overwritten. `--duration 10` limits a
+monitoring session; otherwise it runs until Ctrl+C. The default feedback timeout
+is 0.5 seconds (`--telemetry-timeout`). Run one BLE client at a time.
+
+Decode bytes without Bluetooth:
+
+```sh
+python3 read_outputs.py protocol-decode '02 10 04 01 02 FF 85 94 03'
+python3 read_outputs.py protocol-decode '02 11 05 00 2D 04 B0 01 52 03'
 ```
 
-The timestamp comes from the receiving computer. The reader assembles complete
-newline-terminated messages even when transport reads split or combine them.
-It labels the values rather than preserving the original semicolon layout.
-Unknown text remains visible with a `LOG` label.
+## C++ on the BeagleBone
 
-**Raw binary bits, Bluetooth packet headers, and electrical GPIO/SPI signals
-are outside this reader's current capabilities.** It has no hex/binary display
-option or serial-port mode. The debug sender transmits filtered EEG/EOG values;
-raw ADC bytes, IMU data, and predictions are not included in this stream.
-
-**1. Confirm the equipment and application are ready.**
-
-Use a Linux receiving computer with Python 3.7 or newer, BlueZ, and a working
-Classic Bluetooth adapter. The reader requires no third-party Python packages.
-Its Bluetooth mode requires Linux socket support; native Windows Python does
-not provide the required BlueZ interface, and WSL must actually have access to
-a usable Bluetooth controller.
-
-The standard BeagleBone Black needs an added Bluetooth adapter for this route;
-the BeagleBone Black Wireless has onboard Bluetooth. Check the actual board
-and its Linux adapter support. See the official
-[Black hardware overview](https://docs.beagleboard.org/boards/beaglebone/black/ch04.html)
-and [Black Wireless specifications](https://www.beagleboard.org/boards/beaglebone-black-wireless).
-
-Live acquisition requires the complete, working C++ application on the board,
-including its sensor hardware and required services. **The C++ files in this
-folder cannot currently build by themselves:** dependencies are missing and
-there are source errors. See the [project explanation](README.md). This guide
-cannot supply a build command or executable path for the missing application.
-The examples below use `./main` as a placeholder for its actual executable.
-
-Keep two application terminals available:
-
-| Terminal | Runs on | Purpose |
-|---|---|---|
-| Receiver | Linux receiving computer | Run Python and display incoming messages. |
-| BeagleBone | Board, directly or through an interactive SSH session | Run the acquisition application and type its numeric commands. |
-
-An SSH session can carry your keyboard commands to the board while Bluetooth
-carries the EEG/EOG data to the receiver.
-
-**2. Test the reader on the receiving computer.**
-
-Open a terminal in the `Neuro-Exo` repository root and run:
-
-```bash
-python3 H_Robotics_Files/read_outputs.py demo
+```sh
+sudo apt-get install build-essential cmake pkg-config libglib2.0-dev
+cmake -S . -B build
+cmake --build build
+(cd build && ctest --output-on-failure)
+./build/neuroexo_motor --address AA:BB:CC:DD:EE:FF
+./build/neuroexo_motor --address AA:BB:CC:DD:EE:FF \
+  --mode assistive --speed slow --angle 30 --duration 5 --period-ms 100
 ```
 
-Expect labeled sample lines. This checks Python and the display using synthetic
-data; it does not check the board or Bluetooth connection. The demo also shows
-other supported formats which the live EEG/EOG debug stream does not emit.
+The standalone C++ target requires BlueZ on the system D-Bus and uses the same
+two UUIDs as Python. `--adapter hci1` selects a different adapter.
 
-**3. Identify and pair the Bluetooth adapters.**
-
-On each device, run:
-
-```bash
-bluetoothctl show
-```
-
-Record each device's `Controller` MAC address. `No default controller available`
-means Bluetooth setup must be resolved on that device before continuing.
-Use the receiving computer's Bluetooth address in the sender configuration;
-an IP address or Wi-Fi MAC is not interchangeable with it.
-
-For a first pairing, open `bluetoothctl` on the receiving computer and enter
-these commands at its interactive prompt:
-
-```text
-power on
-agent on
-default-agent
-pairable on
-discoverable on
-show
-```
-
-Keep this window open to answer pairing prompts. In a BeagleBone terminal,
-open `bluetoothctl` and enter:
-
-```text
-power on
-agent on
-default-agent
-scan on
-```
-
-Wait for the receiving computer to appear. Replace the example address below
-with that computer's Bluetooth MAC, then enter the following commands one at
-a time. Complete pairing prompts on both devices before proceeding:
-
-```text
-pair AA:BB:CC:DD:EE:FF
-trust AA:BB:CC:DD:EE:FF
-info AA:BB:CC:DD:EE:FF
-scan off
-quit
-```
-
-Confirm `Paired: yes` and `Trusted: yes`. If already paired, use `info` to check
-the existing pairing instead of repeating `pair`. On the receiver's
-`bluetoothctl` prompt, trust the BeagleBone using the BeagleBone's MAC:
-
-```text
-trust 11:22:33:44:55:66
-info 11:22:33:44:55:66
-discoverable off
-quit
-```
-
-Both MAC addresses above are placeholders. These are Bluetooth setup commands
-documented by [BlueZ](https://github.com/bluez/bluez/blob/master/doc/bluetoothctl.rst).
-The C++ application will make the actual RFCOMM connection directly to channel
-1. The reader does not advertise an SDP service, so a generic Bluetooth
-profile-connect button is not the test for this data connection.
-
-**4. Set the receiving address in the complete BeagleBone application.**
-
-In the application's `main.cpp`, configure `top_hI` before acquisition. For
-example, add the second line immediately after the existing debug-mode setup:
+For the EEG application, link `neuroexo_ble` and use:
 
 ```cpp
-top_hI.debugMode();
-top_hI.setBluetoothDevice("AA:BB:CC:DD:EE:FF", 1);
+hardware.setBluetoothDevice("AA:BB:CC:DD:EE:FF");
+if (!hardware.connectToBluetoothDevice()) throw std::runtime_error("BLE unavailable");
+// Call periodically (<250 ms) only while control is intended:
+hardware.sendMotorControl(neuroexo::Mode::Assistive, neuroexo::Speed::Slow, 30);
+// This consumes a notification; it sends no control or polling packet:
+auto update = hardware.readMotorTelemetry(100);
+if (update) std::cout << neuroexo::describe(update->value) << '\n';
+// Cached feedback throws if missing, stale, or disconnected:
+auto current = hardware.latestMotorTelemetry();
+hardware.stopMotor();
+hardware.disconnectBluetooth();
 ```
 
-Use the receiving computer's actual Bluetooth MAC. Rebuild and deploy the
-complete application using its own build instructions. This is a required
-configuration example, not a change applied to the C++ source by this guide.
-The supplied source leaves the address empty and never calls this setter.
+`Arm_setup()` now only connects. The old simulated calibration, maximum-position,
+start/end-trial, and assistance-velocity methods are removed because those
+commands do not exist in this protocol. Application code using them must migrate
+to the explicit mode/speed/target control fields. The copied EEG application
+still lacks several original drivers/modules; the standalone client builds
+without them. Its position matrix now reads validated telemetry instead of
+`gV.POSITION`; arrange for the acquiring interface to own the BLE connection.
 
-**5. Start the receiver before starting acquisition.**
+## Checks and troubleshooting
 
-In the receiver terminal, from the repository root:
-
-```bash
-python3 H_Robotics_Files/read_outputs.py bluetooth --channel 1
+```sh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Expected startup message:
+Tests compare Python and C++ wire bytes, including signed boundaries, every
+status combination, malformed/oversized/truncated frames, independent TX/RX,
+fault handling, stale feedback, and disconnects. CTest exercises the actual
+BlueZ code against a private fake D-Bus service and the Nano bridge against host
+I2C/BLE substitutes. These checks do not measure or validate physical motor behavior.
 
-```text
-Waiting for one RFCOMM sender on 00:00:00:00:00:00, channel 1.
-Configure the C++ sender with this computer's Bluetooth MAC address.
-```
-
-`00:00:00:00:00:00` means listen on any local Bluetooth adapter. Do not put that
-address into the BeagleBone's sender configuration. If the receiver has
-multiple adapters, select one explicitly:
-
-```bash
-python3 H_Robotics_Files/read_outputs.py bluetooth --bind AA:BB:CC:DD:EE:FF --channel 1
-```
-
-To display and save labeled output, use this command instead of the first one:
-
-```bash
-python3 H_Robotics_Files/read_outputs.py bluetooth --channel 1 | tee -a beaglebone_capture.txt
-```
-
-`tee -a` appends displayed records to the file. Connection messages and errors
-still appear in the terminal on stderr. Run only one listener on the selected
-adapter/channel.
-
-**6. Start acquisition and check for live messages.**
-
-In the BeagleBone terminal, change to the complete application's working
-directory, then launch its executable. For an executable named `main`:
-
-```bash
-./main
-```
-
-After initialization, type the following into the running C++ application's
-terminal and press Enter:
-
-```text
-9
-```
-
-The source maps `9` to EEG/EOG debug acquisition. Expect a Bluetooth connection
-message on the board and `Bluetooth sender connected: ...` on the receiver,
-followed by repeated `[EEG/EOG]` lines with all eight values. Use exact numeric
-commands; the supplied application does not handle arbitrary text input.
-
-**The Python Bluetooth reader receives telemetry only.** Type application
-commands into the BeagleBone terminal. Typing `9` into the Python listener does
-not send it to the board. Its `tcp` mode is a separate robot-arm status poller
-and does not start BeagleBone EEG acquisition.
-
-**7. End the session.**
-
-In the running BeagleBone application, enter `7` and press Enter to request
-the end of the current acquisition stage. The supplied acquisition loop checks
-that flag and then disconnects Bluetooth. This is an application stage command;
-it is not a motor-stop command.
-
-The reader may report `Reader error: peer disconnected` when the sender closes
-the connection. If the reader is still running, press Ctrl+C in its terminal.
-Ctrl+C in the reader closes the viewing connection; it sends no stop command
-to the BeagleBone. For another session, restart the application and listener:
-the supplied code does not visibly reset the end-stage flag, and the reader
-accepts one connection per run.
-
-**If no data appears**
-
-| What you see | What to check |
-|---|---|
-| Reader stays at `Waiting for one RFCOMM sender...` | Confirm the C++ app reached acquisition after `9`, the receiver MAC is configured in the deployed build, both channels are 1, and both adapters are powered and paired. |
-| Board prints `Bluetooth address not configured...` | Add the setter in step 4 and rebuild the complete application. |
-| Board prints `BT connect` or `Failed to connect...` | Start the listener first; check the receiver MAC/channel, pairing, range, and adapter permissions. The acquisition loop does not automatically retry a failed initial connection. |
-| Python reports missing Linux BlueZ RFCOMM support | Use Linux with the required Python socket support and a usable Bluetooth adapter. |
-| `No default controller available` or an adapter/device error | Check that an adapter is present, enabled, and supported by the OS; a USB cable to the board alone does not create the Bluetooth stream. |
-| Permission error | Resolve the Linux user's adapter/socket permissions for the installed distribution. |
-| Connected, but no `[EEG/EOG]` lines | Inspect board-side errors and sensor initialization. The sender must write complete records ending in a newline, and the loop must still be running. |
-| C++ build fails on a missing header | Restore the complete acquisition project and address its source errors; the Python reader cannot repair the producer. |
-
-The reader's demo and command-line options were checked locally. Live
-Bluetooth reception and sensor acquisition have not been verified with a
-connected BeagleBone in this workspace.
+- No Nano found: verify power, the loaded sketch, and adapter power.
+- Service mismatch: load the updated Nano sketch and disconnect other clients.
+- Missing telemetry: verify the Teensy is running the I2C firmware, address
+  `0x08`, shared ground, and the correct bus. No measurements are synthesized.
+- CommandTimeout: monitor mode sends nothing; control mode needs valid frames
+  at intervals below 250 ms, including actual BLE/Linux scheduling delays.
+- SafetyFault: the Teensy has latched its e-stop. The control tool exits and
+  does not resume automatically. Refer to the Teensy controller for the cause.

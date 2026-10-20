@@ -41,7 +41,7 @@
 using namespace std;
 
 Hardware_Interface::Hardware_Interface()
-    : ble_(new neuroexo::BleTrialClient(neuroexo::makeBluezGatt())) {}
+    : ble_(new neuroexo::BleMotorClient(neuroexo::makeBluezGatt())) {}
 
 Hardware_Interface::~Hardware_Interface()
 {
@@ -333,7 +333,7 @@ void Hardware_Interface::startEegStream(int fd, spi_ioc_transfer *transfer)
 void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Channel<Eigen::MatrixXd> *channel1, Channel<Eigen::MatrixXd> *channel2)
 {
     // cout << "Running measure EEG and EOG" << endl;
-    // Acquisition never performs a BLE transaction; runArmTrial owns arm communication.
+    // Acquisition reads cached telemetry; the application owns command scheduling.
     // Used for IMU collection
     // gpio_input = libsoc_gpio_request(GPIO_INPUT, LS_GPIO_SHARED);
     // libsoc_gpio_set_direction(gpio_input, INPUT);
@@ -461,19 +461,20 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
                     outputMatrix(0, 8) = accel_x;                    // imu accel x
                     outputMatrix(0, 9) = accel_y;                    // imu accel y
                     outputMatrix(0, 10) = accel_z;                   // imu accel z
+                    const double armAngle = lastArmPositionDegrees();
                     // Set 11th index val (position)
                     if (module == "callibration_collection")
                     {
                         if (gV.TASK == "flexion")
-                            outputMatrix(0, 11) = 0 - stoi(gV.POSITION);
+                            outputMatrix(0, 11) = 0 - armAngle;
                         else // (gV.TASK == "centerout") //DEFAULT
-                            outputMatrix(0, 11) = 50 - stoi(gV.POSITION);
+                            outputMatrix(0, 11) = 50 - armAngle;
                         outputMatrix(0, 12) = gV.IMAGINE_MOVEMENT ? 1 : 0;
                         outputMatrix(0, 13) = gV.MOVE ? 1 : 0;
                     }
                     else // if module is testing_svm
                     {
-                        outputMatrix(0, 11) = stoi(gV.POSITION);
+                        outputMatrix(0, 11) = armAngle;
                         outputMatrix(0, 12) = gV.MOVEMENT_PREDICTED ? 1 : 0;
                         outputMatrix(0, 13) = gV.IMAGINE_MOVEMENT ? 1 : 0;
                         outputMatrix(0, 14) = gV.MOVE ? 1 : 0;
@@ -775,7 +776,7 @@ void Hardware_Interface::changeBuff(unsigned char *hex, int fd, spi_ioc_transfer
     }
     ioctl(fd, SPI_IOC_MESSAGE(1), transfer);
 }
-// Arm communication uses the trial GATT service; sensor acquisition stays local.
+// Motor control and feedback use separate GATT characteristics.
 void Hardware_Interface::setBluetoothDevice(const std::string& address, const std::string& adapter)
 {
     disconnectBluetooth();
@@ -789,8 +790,7 @@ bool Hardware_Interface::connectToBluetoothDevice()
         if (btAddress.empty())
             throw std::runtime_error("Set the Nano address with setBluetoothDevice(address) first");
         ble_->connect(btAddress, btAdapter);
-        std::cout << "Connected to Nano over BLE GATT"
-                  << (ble_->simulated() ? " (SIMULATED arm)" : "") << std::endl;
+        std::cout << "Connected to Nano: control TX and Teensy telemetry RX" << std::endl;
         return true;
     } catch (const std::exception& error) {
         std::cerr << "BLE connection failed: " << error.what() << std::endl;
@@ -810,74 +810,41 @@ void Hardware_Interface::disconnectBluetooth()
 }
 
 bool Hardware_Interface::isBluetoothConnected() const { return ble_->connected(); }
-bool Hardware_Interface::isBluetoothSimulated() const { return ble_->simulated(); }
+void Hardware_Interface::sendMotorControl(neuroexo::Mode mode, neuroexo::Speed speed, int16_t targetAngleDeg)
+{
+    // Establish a connection explicitly. Never resume motion through an implicit reconnect.
+    ble_->sendControl({mode, speed, targetAngleDeg});
+}
 
-void Hardware_Interface::calibrateArm()
+void Hardware_Interface::stopMotor() { ble_->stopMotor(); }
+
+std::optional<neuroexo::TelemetryUpdate> Hardware_Interface::readMotorTelemetry(int timeoutMs)
+{
+    return ble_->receiveTelemetry(timeoutMs);
+}
+
+neuroexo::TelemetryUpdate Hardware_Interface::latestMotorTelemetry(int maxAgeMs) const
+{
+    return ble_->latestTelemetry(maxAgeMs);
+}
+
+double Hardware_Interface::lastArmPositionDegrees() const
+{
+    return latestMotorTelemetry().value.currentAngleDeg;
+}
+
+void Hardware_Interface::Arm_setup()
 {
     requireBluetooth();
-    ble_->calibrate();
-}
-
-void Hardware_Interface::setMaxPosition(double degrees)
-{
-    requireBluetooth();
-    ble_->setMaximumPosition(degrees);
-}
-
-void Hardware_Interface::configureTrial(const neuroexo::TrialSettings& settings)
-{
-    requireBluetooth();
-    ble_->configure(settings);
-}
-
-void Hardware_Interface::startTrial(uint16_t trial)
-{
-    requireBluetooth();
-    ble_->start(trial);
-}
-
-neuroexo::ArmPosition Hardware_Interface::readArmPosition(uint16_t trial)
-{
-    requireBluetooth();
-    const auto position = ble_->position(trial);
-    armPositionMilliDegrees_.store(int32_t(std::llround(position.degrees * neuroexo::SCALE)));
-    return position;
-}
-
-void Hardware_Interface::endTrial(uint16_t trial)
-{
-    // Never reconnect just to send End: a new connection is a new receiver session.
-    if (!ble_->connected()) throw std::runtime_error("Cannot confirm End: Nano disconnected");
-    ble_->end(trial);
-}
-
-neuroexo::TrialTiming Hardware_Interface::runArmTrial(
-    const neuroexo::TrialSettings& settings, std::chrono::milliseconds duration,
-    std::function<void(const neuroexo::ArmPosition&)> onPosition,
-    std::function<bool()> shouldStop)
-{
-    requireBluetooth();
-    return ble_->runTrial(settings, duration, std::chrono::milliseconds(40),
-        [this, onPosition](const neuroexo::ArmPosition& position) {
-            armPositionMilliDegrees_.store(int32_t(std::llround(position.degrees * neuroexo::SCALE)));
-            if (onPosition) onPosition(position);
-        }, shouldStop);
-}
-
-void Hardware_Interface::Arm_setup(double& maxPosition)
-{
-    // The protocol does not invent a measured limit: caller supplies degrees.
-    if (!std::isfinite(maxPosition) || maxPosition <= 0 || maxPosition > 360)
-        throw std::invalid_argument("Arm_setup requires a maximum position in (0,360] degrees");
-    calibrateArm();
-    setMaxPosition(maxPosition);
+    // The wire protocol has no calibration/homing or maximum-position commands.
 }
 
 void Hardware_Interface::debugArm()
 {
-    const auto position = readArmPosition(0);
-    std::cout << "Arm position: " << position.degrees << " deg"
-              << (position.simulated ? " [SIMULATED]" : "") << std::endl;
+    requireBluetooth();
+    const auto update = readMotorTelemetry(500);
+    if (!update) throw std::runtime_error("Teensy telemetry missing or stale");
+    std::cout << neuroexo::describe(update->value) << std::endl;
 }
 
 void Hardware_Interface::logEEGEOG(const MatrixXd& eeg_eog)
