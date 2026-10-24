@@ -1,44 +1,58 @@
 # Neuro-Exo
 
-This repository contains the University of Houston New NeuroExo Senior Design project, focused on restoring arm mobility for stroke patients using an electronically controlled assistive/resistive exoskeleton system.
+This repository contains the University of Houston New NeuroExo Senior Design
+project, focused on restoring arm mobility for stroke patients using an
+electronically controlled assistive/resistive exoskeleton system.
 
-## System Features
+## Motor communication
 
-### Dynamic Force Control for Motor Assistance
+The BeagleBone client and Nano 33 BLE bridge use separate BLE command and
+telemetry characteristics. The Nano validates 9-byte control frames, forwards
+them over I2C to address `0x08`, and relays valid 10-byte telemetry frames back to
+the BeagleBone. Telemetry contains motor angle, current, and status flags.
 
-The Teensy 4.1 control firmware includes a dynamic assist algorithm that adjusts motor command force in real time using:
-- Joint velocity
-- Joint acceleration
-- Motor current (used as a torque-related effort signal)
-
-The control path combines trajectory/PID output with assist modulation to increase support when user movement is faster or requires more effort, and reduce abrupt changes through filtering and slew-rate limiting.
-
-Implementation references:
-- NeuroExoFirmware/src/ControlAlgorithm.cpp
-- NeuroExoFirmware/src/main.cpp
-
-### Bluetooth to I2C Command Bridge
-
-Motion commands are sent over Bluetooth to an Arduino Nano 33 BLE, which acts as a communication bridge and forwards commands over I2C to the Teensy 4.1 motor controller.
-
-Data flow:
-1. BLE central sends command payload to Nano 33 BLE.
-2. Nano 33 BLE parses command values.
-3. Nano 33 BLE transmits command bytes to Teensy 4.1 over I2C.
-4. Teensy 4.1 executes interpolation and motor control.
+See the [setup guide](H_Robotics_Files/BEAGLEBONE_READER_PROCEDURE.md) and
+[binary protocol](H_Robotics_Files/NEUROEXO_PROTOCOL.md).
 
 Implementation references:
-- NeuroExoFirmware/src/Nano33BLEFirmware/Nano33BLEFirmware.ino
-- NeuroExoFirmware/src/main.cpp
 
-### Power Management System Firmware
+- [Nano bridge](NeuroExoFirmware/src/nanoBridge.cpp)
+- [Protocol header](NeuroExoFirmware/src/commProtocol.h)
+- [Protocol implementation](NeuroExoFirmware/src/commProtocol.cpp)
+- [BeagleBone interface](H_Robotics_Files/Hardware_Interface.hpp)
 
-The project also includes firmware for a power management subsystem on an Arduino Nano 33 connected to:
-- A relay for load connection/disconnection
-- A buck-converted supply path
-- Polarity protection hardware services
+PlatformIO's `nano33ble` environment builds the framed bridge. The older
+[Nano sketch](NeuroExoFirmware/src/Nano33BLEFirmware.ino) is retained from `main`
+but excluded from that build. The old BLE benchmark tools, simulated trial
+protocol, and `DemoFolder` have been removed.
 
-Current PMS logic includes under-voltage protection with hysteresis-based relay control.
+**Teensy compatibility:** the [Teensy controller](NeuroExoFirmware/src/main.cpp)
+imported from `main` still accepts the legacy three-byte `0x01` angle command.
+It does not yet decode the framed protocol or return I2C telemetry. The framed
+Nano/BeagleBone path requires the separately supplied Teensy firmware implementing
+the protocol above; the two firmware environments in this checkout are not yet
+a matching control/telemetry pair.
+
+## Dynamic force control for motor assistance
+
+The Teensy 4.1 controller imported from `main` includes an assist algorithm that
+adjusts motor output using joint velocity, acceleration, and motor current as an
+effort signal. It combines trajectory/PID output with assist modulation,
+filtering, and slew-rate limiting.
+
+Implementation references:
+
+- [Assist algorithm](NeuroExoFirmware/src/ControlAlgorithm.cpp)
+- [Teensy controller](NeuroExoFirmware/src/main.cpp)
+- [Serial joint visualizer](NeuroExoFirmware/tools/visualizer/README.md)
+
+## Power management system
+
+The project includes firmware for a power management subsystem on an Arduino
+Nano 33 BLE, with a relay for load connection/disconnection, a buck-converted
+supply path, and polarity protection hardware. Its firmware provides
+under-voltage protection with hysteresis-based relay control.
 
 Implementation reference:
-- PMSFirmware/NeuroExo_PMS_Code.ino
+
+- [Power management firmware](PMSFirmware/NeuroExo_PMS_Code.ino)

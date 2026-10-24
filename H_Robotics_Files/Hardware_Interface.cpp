@@ -13,16 +13,14 @@
 #include <vector>
 #include <algorithm> // for std::remove
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <errno.h>
 #include <random>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <stdexcept>
+#include <cstring>
 /// Libraries from libsoc that is for gpio management because of the interrupt.
 // #include <libsoc_gpio.h>
 // #include <libsoc_debug.h>
@@ -41,6 +39,19 @@
 // }
 
 using namespace std;
+
+Hardware_Interface::Hardware_Interface()
+    : ble_(new neuroexo::BleMotorClient(neuroexo::makeBluezGatt())) {}
+
+Hardware_Interface::~Hardware_Interface()
+{
+    disconnectBluetooth();
+    if (fd >= 0) close(fd);
+    delete filtering;
+    delete high_pass;
+}
+
+int Hardware_Interface::getAmpEeg() { return ampEeg; }
 
 void Hardware_Interface::startAmp()
 {
@@ -127,10 +138,14 @@ int Hardware_Interface::getAmpEog()
  ***/
 void Hardware_Interface::setAmpEeg(int amplification)
 {
+    if (amplification < 0 || amplification > 6)
+        throw std::invalid_argument("gain index must be 0..6");
     this->ampEeg = amplification;
 }
 void Hardware_Interface::setAmpEog(int amplification)
 {
+    if (amplification < 0 || amplification > 6)
+        throw std::invalid_argument("gain index must be 0..6");
     this->ampEog = amplification;
 }
 /***
@@ -296,7 +311,7 @@ void Hardware_Interface::startEegStream(int fd, spi_ioc_transfer *transfer)
     hexes[0] = 0x43;
     hexes[2] = 0xEC; // CHANGE 2 JOSE
     changeBuff(hexes, fd, transfer);
-    sleep(0.20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     /// Read data discrete mode. Could be changed for 0x10 which would be reading data continously.
     hexes[0] = 0x10;
@@ -318,13 +333,7 @@ void Hardware_Interface::startEegStream(int fd, spi_ioc_transfer *transfer)
 void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Channel<Eigen::MatrixXd> *channel1, Channel<Eigen::MatrixXd> *channel2)
 {
     // cout << "Running measure EEG and EOG" << endl;
-    // Connect to Python for BLE transmission (if running debug)
-    connectToPythonServer();
-    if (!pythonConnected)
-    {
-        std::cerr << "Failed to connect to Python server in measureEEGEOG" << std::endl;
-        // return;
-    }
+    // Acquisition reads cached telemetry; the application owns command scheduling.
     // Used for IMU collection
     // gpio_input = libsoc_gpio_request(GPIO_INPUT, LS_GPIO_SHARED);
     // libsoc_gpio_set_direction(gpio_input, INPUT);
@@ -336,7 +345,6 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
     imu_cp.setSensAcc(6384); // hard coded
     imu_cp.setSensGyr(131);  // hard coded
 
-    const int sampleCount = 25; // collect 25 samples (100 ms worth)
 
     // FOR BASELINE COLLECTION
     auto startTime = chrono::steady_clock::now();
@@ -387,6 +395,7 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
         //---------------------------------------------------------
 
         // Get most recent imu data element in s vector
+        if (imu_cp.s.empty()) throw std::runtime_error("IMU returned no sample");
         string lastData = imu_cp.s.back();
         // cout << "COLLECTED IMU DATA: " << lastData << endl;
         //  Parse the string
@@ -405,6 +414,8 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
             values.push_back(val);
         }
 
+        if (values.size() < 3) throw std::runtime_error("Malformed IMU sample");
+
         // Extract accelerometer XYZ (first 3 values)
         double accel_x = values[0];
         double accel_y = values[1];
@@ -412,7 +423,7 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
         if (accel_x == 0.0 && accel_y == 0.0 && accel_z == 0.0 && !debug) // dont let this print during debug eeg
         {
             cout << "[ERROR] IMU VALUES ARE ZERO" << endl;
-            sendUpdateToPython("ERROR", "ZEROS"); // sends error message: ERROR=ZEROS
+            // Report locally; arm communication has no Python/network update bridge.
         }
         // cout << "EXTRACTED ACCELEROMETER XYZ: " << accel_x << ", " << accel_y << ", " << accel_z << endl;
 
@@ -424,11 +435,7 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
 
         if (debug) // for debug eeg mode
         {
-            // Send filteredMatrix containing all eeg and eog channels
-            if (pythonConnected)
-            {
-                sendEEGEOGToApp(filteredMatrix);
-            }
+            logEEGEOG(filteredMatrix);
         }
         else
         {
@@ -454,19 +461,20 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
                     outputMatrix(0, 8) = accel_x;                    // imu accel x
                     outputMatrix(0, 9) = accel_y;                    // imu accel y
                     outputMatrix(0, 10) = accel_z;                   // imu accel z
+                    const double armAngle = lastArmPositionDegrees();
                     // Set 11th index val (position)
                     if (module == "callibration_collection")
                     {
                         if (gV.TASK == "flexion")
-                            outputMatrix(0, 11) = 0 - stoi(gV.POSITION);
+                            outputMatrix(0, 11) = 0 - armAngle;
                         else // (gV.TASK == "centerout") //DEFAULT
-                            outputMatrix(0, 11) = 50 - stoi(gV.POSITION);
+                            outputMatrix(0, 11) = 50 - armAngle;
                         outputMatrix(0, 12) = gV.IMAGINE_MOVEMENT ? 1 : 0;
                         outputMatrix(0, 13) = gV.MOVE ? 1 : 0;
                     }
                     else // if module is testing_svm
                     {
-                        outputMatrix(0, 11) = stoi(gV.POSITION);
+                        outputMatrix(0, 11) = armAngle;
                         outputMatrix(0, 12) = gV.MOVEMENT_PREDICTED ? 1 : 0;
                         outputMatrix(0, 13) = gV.IMAGINE_MOVEMENT ? 1 : 0;
                         outputMatrix(0, 14) = gV.MOVE ? 1 : 0;
@@ -507,23 +515,43 @@ void Hardware_Interface::measureEEGEOG(int fd, spi_ioc_transfer *transfer, Chann
     }
     cout << "[ENDING]Measure eeg and eog" << endl;
 
-    disconnectPython();
 }
 // Filters both EOG and EEG channels
 Eigen::MatrixXd Hardware_Interface::FilterVoltage(const Eigen::MatrixXd &voltageMatrix, double HighBound)
 {
-    int rows = voltageMatrix.rows(); // samples (25)
+    int rows = voltageMatrix.rows(); // samples (1)
     int cols = voltageMatrix.cols(); // channels (8)
+    if (cols != 8 || rows < 1 || !std::isfinite(HighBound) || HighBound <= 0 || HighBound >= 125)
+        throw std::invalid_argument("filter requires eight channels and a cutoff in (0,125) Hz");
+
+    // Trying to stop drifting in eeg values by resetinng wh and Pt1 after 10 samples  -> commenting out workaround
+    // hinfSampleCount++;
+    // if (hinfSampleCount >= 10)
+    // {
+    //     hinfSampleCount = 0;
+    //     wh = MatrixXd::Zero(3, 8);
+    //     Pt1 = MatrixXd::Zero(24, 3);
+    //     for (int i = 0; i < 8; i++)
+    //         Pt1.block(i * 3, 0, 3, 3).diagonal().setConstant(0.5);
+    // }
 
     Eigen::MatrixXd outputMatrix(rows, cols);
 
     // === Process all 8 channels (EEG + EOG) ===
 
+    if (highPassCutoff_ != HighBound) {
+        for (int ch = 0; ch < 8; ++ch) {
+            highPassFilters_[ch].reset(new Filter(HPF, 2, 250.0, HighBound));
+            lowPassFilters_[ch].reset(new Filter(LPF, 2, 250.0, 30.0));
+        }
+        highPassCutoff_ = HighBound;
+    }
+
     // Step 1: High-pass filter
     Eigen::MatrixXd hpFiltered(rows, cols); // changed from 5 to cols
     for (int ch = 0; ch < cols; ch++)       // changed from 5 to cols
     {
-        Filter filteringHP(HPF, 2, 250.0, HighBound);
+        Filter& filteringHP = *highPassFilters_[ch];
         for (int i = 0; i < rows; i++)
         {
             hpFiltered(i, ch) = filteringHP.do_sample(voltageMatrix(i, ch));
@@ -579,7 +607,7 @@ Eigen::MatrixXd Hardware_Interface::FilterVoltage(const Eigen::MatrixXd &voltage
     // Step 3: Low-pass filter
     for (int ch = 0; ch < cols; ch++) // changed from 5 to cols
     {
-        Filter filteringLP(LPF, 2, 250.0, 30.0);
+        Filter& filteringLP = *lowPassFilters_[ch];
         for (int i = 0; i < rows; i++)
         {
             outputMatrix(i, ch) = filteringLP.do_sample(hinfFiltered(i, ch));
@@ -597,34 +625,14 @@ Eigen::MatrixXd Hardware_Interface::FilterVoltage(const Eigen::MatrixXd &voltage
 
 void Hardware_Interface::toVoltage(uint8_t number[])
 {
-    double gain = 24.0;
-    double multiplier = (9.0 / gain) / pow(2, 24); // Conversion Factor
-
-    for (int i = 0; i < 8; i++)
-    {
-        int index_one = i * 3;
-        int index_two = index_one + 1;
-        int index_three = index_one + 2;
-
-        uint8_t number_one = number[index_one];
-        uint8_t number_two = number[index_two];
-        uint8_t number_three = number[index_three];
-
-        bool is_positive = number_one <= 0x7F;
-
-        uint8_t number_volts[4];
-        number_volts[0] = is_positive ? 0x00 : 0xFF;
-        number_volts[1] = number_one;
-        number_volts[2] = number_two;
-        number_volts[3] = number_three;
-
-        // Combine into signed 32-bit int
-        int32_t signed_value = (int32_t)((number_volts[0] << 24) |
-                                         (number_volts[1] << 16) |
-                                         (number_volts[2] << 8) |
-                                         number_volts[3]);
-
-        volts[i] = signed_value * multiplier;
+    for (int channel = 0; channel < 8; ++channel) {
+        const int offset = channel * 3;
+        const uint32_t raw = (uint32_t(number[offset]) << 16) |
+                             (uint32_t(number[offset + 1]) << 8) | number[offset + 2];
+        const int32_t signedValue = (raw & 0x800000)
+            ? int32_t(raw) - 0x1000000 : int32_t(raw);
+        const int gain = gainValues[channel < 5 ? ampEeg : ampEog];
+        volts[channel] = signedValue * (9.0 / gain) / 16777216.0;
     }
 }
 
@@ -762,507 +770,94 @@ const unsigned char *Hardware_Interface::getRawRx() const
 
 void Hardware_Interface::changeBuff(unsigned char *hex, int fd, spi_ioc_transfer *transfer)
 {
-    for (int m = 0; m < len_data; m++)
+    for (uint32_t m = 0; m < len_data; m++)
     {
         tx_buff_2[m] = hex[m];
     }
     ioctl(fd, SPI_IOC_MESSAGE(1), transfer);
 }
-void Hardware_Interface::Arm_setup(double &maxPosition)
+// Motor control and feedback use separate GATT characteristics.
+void Hardware_Interface::setBluetoothDevice(const std::string& address, const std::string& adapter)
 {
-    cout << "[RUNNING] Arm setup" << endl;
+    disconnectBluetooth();
+    btAddress = address;
+    btAdapter = adapter;
+}
 
-    int samplingRate = 50;
-    gV.TARGET = "100";
-    gV.HOME = "0";
-    // string ipAddress = "192.168.0.120"; // Replace with your robot arm's IP -> USE THIS
-    string ipAddress = "127.0.0.1"; // LOCALHOST IP ADDRESS -> USED FOR AT HOME TESTS ONLY
-    int port = 11999;               // Replace with your robot arm's port
-    maxPosition = 0.0;
-
-    // Send target to app
-    sendUpdateToPython("target", gV.TARGET);
-
-    for (int i = 0; i < 5000 / samplingRate; i++)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP)
-        {
-            // stop everyting
-            std::exit(0);
-        }
-        usleep(samplingRate * 1000);
+bool Hardware_Interface::connectToBluetoothDevice()
+{
+    try {
+        if (btAddress.empty())
+            throw std::runtime_error("Set the Nano address with setBluetoothDevice(address) first");
+        ble_->connect(btAddress, btAdapter);
+        std::cout << "Connected to Nano: control TX and Teensy telemetry RX" << std::endl;
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "BLE connection failed: " << error.what() << std::endl;
+        return false;
     }
+}
 
-    // RESET
-    gV.REST = false;
-    gV.MOVE = false;
-    gV.IMAGINE_MOVEMENT = false;
-    gV.FIXATE = false;
-    gV.POSITION = (0 > 100) ? "100" : "0";
+void Hardware_Interface::requireBluetooth()
+{
+    if (!ble_->connected() && !connectToBluetoothDevice())
+        throw std::runtime_error("Nano BLE connection unavailable");
+}
 
-    // Send position to app
-    sendUpdateToPython("position", gV.POSITION);
+void Hardware_Interface::disconnectBluetooth()
+{
+    ble_->disconnect();
+}
 
-    // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
-        perror("Can't create socket");
-        return;
-    }
+bool Hardware_Interface::isBluetoothConnected() const { return ble_->connected(); }
+void Hardware_Interface::sendMotorControl(neuroexo::Mode mode, neuroexo::Speed speed, int16_t targetAngleDeg)
+{
+    // Establish a connection explicitly. Never resume motion through an implicit reconnect.
+    ble_->sendControl({mode, speed, targetAngleDeg});
+}
 
-    // Connect
-    sockaddr_in hint{};
-    hint.sin_family = AF_INET;
-    hint.sin_port = htons(port);
-    inet_pton(AF_INET, ipAddress.c_str(), &hint.sin_addr);
+void Hardware_Interface::stopMotor() { ble_->stopMotor(); }
 
-    if (connect(sock, (sockaddr *)&hint, sizeof(hint)) < 0) // IF CANT CONNECT, ARM ISNT CONNECTED SO INFORM APP
-    {
-        perror("Can't connect to server");
-        sendUpdateToPython("ERROR", "ARM"); // sends error message: ERROR=ARM
-        close(sock);
-        return;
-    }
+std::optional<neuroexo::TelemetryUpdate> Hardware_Interface::readMotorTelemetry(int timeoutMs)
+{
+    return ble_->receiveTelemetry(timeoutMs);
+}
 
-    // Send one command
-    std::string msgToSend = "3\t0.500000\t\n";
+neuroexo::TelemetryUpdate Hardware_Interface::latestMotorTelemetry(int maxAgeMs) const
+{
+    return ble_->latestTelemetry(maxAgeMs);
+}
 
-    sendWithTimeout(sock, msgToSend, 5000); // only timeout this send
+double Hardware_Interface::lastArmPositionDegrees() const
+{
+    return latestMotorTelemetry().value.currentAngleDeg;
+}
 
-    std::string response;
-    if (recvImmediate(sock, response, 5000, 1000))
-    {
-        // cout << "First receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-    for (int i = 0; i < 3000 / samplingRate; i++)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP)
-        {
-            // stop everyting
-            std::exit(0);
-        }
-        usleep(samplingRate * 1000);
-    }
-
-    gV.THERAPY_STAGE = "prepareForMax";
-
-    // Send therapy_stage to app
-    sendUpdateToPython("therapy_stage", gV.THERAPY_STAGE);
-
-    std::string msgToSendtwo = "7\t0.500000\t\n";
-    sendWithTimeout(sock, msgToSendtwo, 5000); // only timeout this send
-    std::string responsetwo;
-    if (recvImmediate(sock, responsetwo, 5000, 1000))
-    {
-        // cout << "Second receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-
-    usleep(3000 * 1000);
-    cout << "Start now" << endl;
-    std::string msgToSendthree = "0\t0.500000\t\n";
-    for (int i = 0; i < 10000 / samplingRate; i++)
-    {
-        gV.THERAPY_STAGE = "max";
-
-        // Send therapy_stage to app
-        sendUpdateToPython("therapy_stage", gV.THERAPY_STAGE);
-
-        send(sock, msgToSendthree.c_str(), msgToSendthree.size(), 0);
-        string responsethree;
-        if (recvImmediate(sock, responsethree, 5000, 28))
-        {
-            // Cleanup
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\r'), responsethree.end());
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\n'), responsethree.end());
-
-            // Replace ".." with "."
-            size_t pos = 0;
-            while ((pos = responsethree.find("..", pos)) != std::string::npos)
-            {
-                responsethree.replace(pos, 2, ".");
-                pos += 1;
-            }
-
-            // Extract third value
-            std::string thirdValue = extractThirdToken(responsethree);
-            double thirdNum = std::stod(thirdValue);
-            if (thirdNum < 1.0)
-            {
-                thirdNum = 1.0;
-            }
-            gV.POSITION = (thirdNum > 100) ? "100" : thirdValue;
-
-            // Send position to app
-            sendUpdateToPython("position", gV.POSITION);
-
-            if (thirdNum > maxPosition)
-            {
-                maxPosition = thirdNum;
-            }
-            // cout << "Current position: " << thirdNum << endl;
-        }
-
-        usleep(50 * 1000);
-    }
-    for (int i = 0; i < 4000 / samplingRate; i++)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP)
-        {
-            // stop everyting
-            std::exit(0);
-        }
-        usleep(samplingRate * 1000);
-        gV.THERAPY_STAGE = "soon";
-
-        // Send therapy_stage to app
-        sendUpdateToPython("therapy_stage", gV.THERAPY_STAGE);
-    }
-    std::string msgToSendfour = "4\t0.500000\t\n";
-    std::string responsefour;
-    sendWithTimeout(sock, msgToSendfour, 5000);
-    if (recvImmediate(sock, responsefour, 1000, 100))
-    {
-        // cout << "fourth data received succesfully" << endl;
-        // cout << "Fourth response: " << responsefour << endl;
-    }
-    else
-    {
-        cerr << "Fourth data failed to receive";
-    }
-    std::string msgToSendfifth = "7\t0.500000\t\n";
-    sendWithTimeout(sock, msgToSendfifth, 5000);
-    std::string responsefifth;
-    if (recvImmediate(sock, responsefifth, 1000, 100))
-    {
-        // cout << "fifth data received succesfully" << endl;
-        // cout << "Fifth response: " << responsefifth << endl;
-    }
-    else
-    {
-        cerr << "Fifth data failed to receive";
-    }
-    // cout << "\n---" << endl;
-    cout << "Max position reaced: " << maxPosition << endl;
-    // cout << "---\n"
-    //<< endl;
-    // Cleanup
-    // close(sock);
+void Hardware_Interface::Arm_setup()
+{
+    requireBluetooth();
+    // The wire protocol has no calibration/homing or maximum-position commands.
 }
 
 void Hardware_Interface::debugArm()
 {
-    cout << "[RUNNING] Debug arm Module" << endl;
-
-    int samplingRate = 50;
-    // string ipAddress = "192.168.0.120"; // Replace with your robot arm's IP -> USE THIS
-    string ipAddress = "127.0.0.1"; // LOCALHOST IP ADDRESS -> USED FOR AT HOME TESTS ONLY
-    int port = 11999;               // Replace with your robot arm's port
-
-    gV.POSITION = (0 > 100) ? "100" : "0";
-    gV.HOME = "0";
-
-    // Send position to app
-    sendUpdateToPython("position", gV.POSITION);
-
-    // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
-        perror("Can't create socket");
-        return;
-    }
-
-    // Connect
-    sockaddr_in hint{};
-    hint.sin_family = AF_INET;
-    hint.sin_port = htons(port);
-    inet_pton(AF_INET, ipAddress.c_str(), &hint.sin_addr);
-
-    if (connect(sock, (sockaddr *)&hint, sizeof(hint)) < 0) // IF CANT CONNECT, ARM ISNT CONNECTED SO INFORM APP
-    {
-        perror("Can't connect to server");
-        sendUpdateToPython("ERROR", "ARM"); // sends error message: ERROR=ARM
-        close(sock);
-        return;
-    }
-
-    // Send one command
-    std::string msgToSend = "3\t0.500000\t\n";
-
-    sendWithTimeout(sock, msgToSend, 5000); // only timeout this send
-
-    std::string response;
-    if (recvImmediate(sock, response, 5000, 1000))
-    {
-        // cout << "First receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-
-    std::string msgToSendtwo = "7\t0.500000\t\n";
-    sendWithTimeout(sock, msgToSendtwo, 5000); // only timeout this send
-    std::string responsetwo;
-    if (recvImmediate(sock, responsetwo, 5000, 1000))
-    {
-        // cout << "Second receive successful";
-    }
-    else
-    {
-        cerr << "No data received or error occurred\n";
-    }
-
-    std::string msgToSendthree = "0\t0.500000\t\n";
-    bool stop = false;
-    while (!stop)
-    {
-        if (gV.END_STAGE || gV.EMERGENCY_STOP) // end next iteration
-            stop = true;
-
-        send(sock, msgToSendthree.c_str(), msgToSendthree.size(), 0);
-        string responsethree;
-        if (recvImmediate(sock, responsethree, 5000, 50))
-        {
-            // Cleanup
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\r'), responsethree.end());
-            responsethree.erase(std::remove(responsethree.begin(), responsethree.end(), '\n'), responsethree.end());
-
-            // Replace ".." with "."
-            size_t pos = 0;
-            while ((pos = responsethree.find("..", pos)) != std::string::npos)
-            {
-                responsethree.replace(pos, 2, ".");
-                pos += 1;
-            }
-
-            // Extract third value
-            std::string thirdValue = extractThirdToken(responsethree);
-            double thirdNum = std::stod(thirdValue);
-            gV.POSITION = (thirdNum > 100) ? "100" : thirdValue;
-
-            // Send position to app
-            sendUpdateToPython("position", gV.POSITION);
-        }
-
-        usleep(50 * 1000); // arm sampling rate
-    }
+    requireBluetooth();
+    const auto update = readMotorTelemetry(500);
+    if (!update) throw std::runtime_error("Teensy telemetry missing or stale");
+    std::cout << neuroexo::describe(update->value) << std::endl;
 }
 
-// Helper functions -----------------------------------------------------------------------------------------------
-bool Hardware_Interface::recvImmediate(int sock, std::string &out, int timeoutMs, int maxBytesToRead)
+void Hardware_Interface::logEEGEOG(const MatrixXd& eeg_eog)
 {
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-
-    timeval timeout;
-    timeout.tv_sec = timeoutMs / 1000;
-    timeout.tv_usec = (timeoutMs % 1000) * 1000;
-
-    int sel = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
-    if (sel > 0 && FD_ISSET(sock, &readfds))
-    {
-        char buf[1000];
-        int bytesReceived = recv(sock, buf, maxBytesToRead, 0);
-        if (bytesReceived > 0)
-        {
-            out.assign(buf, bytesReceived);
-            return true;
-        }
+    // Diagnostic EEG text is local stdout, consumable by read_outputs.py stdin.
+    // EEG samples are not interpreted as arm commands or sent on the control service.
+    for (int i = 0; i < 8; ++i) {
+        if (i) std::cout << ';';
+        std::cout << eeg_eog(0, i);
     }
-    else if (sel == 0) // WHEN THIS OCCURS, ARM CONNECTION HAS FAILED SO INFORM APP
-    {
-        cerr << "Timeout: No data within " << timeoutMs << " ms\n";
-        sendUpdateToPython("ERROR", "ARM"); // sends error message: ERROR=ARM
-    }
-    else
-    {
-        perror("select failed");
-    }
-    return false;
+    std::cout << '\n';
 }
 
-bool Hardware_Interface::sendWithTimeout(int sock, const std::string &data, int timeoutMs)
-{
-    fd_set writefds;
-    FD_ZERO(&writefds);
-    FD_SET(sock, &writefds);
-
-    timeval timeout;
-    timeout.tv_sec = timeoutMs / 1000;
-    timeout.tv_usec = (timeoutMs % 1000) * 1000;
-
-    int sel = select(sock + 1, nullptr, &writefds, nullptr, &timeout);
-    if (sel > 0 && FD_ISSET(sock, &writefds))
-    {
-        int bytesSent = send(sock, data.c_str(), data.size(), 0);
-        return bytesSent >= 0;
-    }
-    cerr << "Send timeout or error\n";
-    return false;
-}
-std::string Hardware_Interface::extractThirdToken(const std::string &str)
-{
-    std::istringstream iss(str);
-    std::string token;
-    int index = 0;
-
-    while (iss >> token)
-    {
-        if (index == 2)
-        {
-            return token; // third token found
-        }
-        ++index;
-    }
-
-    return ""; // if there weren't at least 3 tokens
-}
-
-// PYTHON SERVER FUNCTIONS -----------------------------------------------------------------------------------------------
-
-void Hardware_Interface::connectToPythonServer()
-{
-    pythonSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (pythonSocket < 0)
-    {
-        std::cerr << "❌ Failed to create socket for Python server" << std::endl;
-        pythonConnected = false;
-        return;
-    }
-
-    sockaddr_in hint{};
-    hint.sin_family = AF_INET;
-    hint.sin_port = htons(65432);                    // Python server port
-    inet_pton(AF_INET, "127.0.0.1", &hint.sin_addr); // localhost
-
-    // std::cout << "🔌 Connecting to Python BLE server..." << std::endl; // not needed
-
-    if (connect(pythonSocket, (sockaddr *)&hint, sizeof(hint)) < 0)
-    {
-        std::cerr << "❌ Failed to connect to Python server on port 65432" << std::endl;
-        std::cerr << "   Make sure server.py is running!" << std::endl;
-        close(pythonSocket);
-        pythonConnected = false;
-        return;
-    }
-
-    std::cout << "✅ Connected to Python BLE server on port 65432" << std::endl;
-    pythonConnected = true;
-}
-
-void Hardware_Interface::sendPositionToPython(double position)
-{
-    if (!pythonConnected || pythonSocket < 0)
-    {
-        return;
-    }
-
-    // Send just the position value as a string with newline
-    std::string message = std::to_string(position) + "\n";
-
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
-    if (sent < 0)
-    {
-        std::cerr << "❌ Failed to send position to Python server" << std::endl;
-        pythonConnected = false;
-    }
-    else
-    {
-        std::cout << "📤 Sent position to BLE: " << position << std::endl;
-    }
-}
-
-void Hardware_Interface::disconnectPython()
-{
-    if (pythonSocket >= 0)
-    {
-        close(pythonSocket);
-        pythonSocket = -1;
-    }
-    pythonConnected = false;
-    std::cout << "🔌 Disconnected from Python server" << std::endl;
-}
-void Hardware_Interface::sendCommandToPython(const std::string &command)
-{
-    if (!pythonConnected || pythonSocket < 0)
-    {
-        return;
-    }
-
-    std::string message = command + "\n";
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
-
-    if (sent < 0)
-    {
-        std::cerr << "❌ Failed to send command: " << command << std::endl;
-    }
-    else
-    {
-        // std::cout << "📤 Sent command: " << command << std::endl;
-    }
-}
-
-void Hardware_Interface::sendFullDataToPython(double eeg1, double eeg2, double eeg3,
-                                              double eeg4, double eeg5, double position,
-                                              int imagine, int move)
-{
-    if (!pythonConnected || pythonSocket < 0)
-        return;
-
-    // Format: "eeg1,eeg2,eeg3,eeg4,eeg5,position,imagine,move\n"
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(9);
-    oss << eeg1 << "," << eeg2 << "," << eeg3 << ","
-        << eeg4 << "," << eeg5 << ","
-        << position << "," << imagine << "," << move << "\n";
-
-    std::string message = oss.str();
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
-
-    if (sent < 0)
-    {
-        std::cerr << "❌ Failed to send data to Python" << std::endl;
-    }
-}
-void Hardware_Interface::sendEEGEOGToApp(MatrixXd eeg_eog)
-{
-    if (!pythonConnected || pythonSocket < 0)
-        return;
-
-    std::ostringstream oss;
-    // oss << std::fixed << std::setprecision(2);
-
-    for (int i = 0; i < 8; i++)
-    {
-        oss << eeg_eog(0, i);
-        if (i < 7)
-            oss << ";";
-    }
-    oss << "\n";
-
-    std::string message = oss.str();
-
-    // ADD THIS DEBUG LINE: -> NOT NEEDED ANYMORE
-    // std::cout << "\n Sending to Python: " << message << std::flush;
-
-    ssize_t sent = send(pythonSocket, message.c_str(), message.size(), 0);
-
-    if (sent < 0)
-    {
-        std::cerr << "Failed to send EEG and EOG to Python" << std::endl;
-    }
-}
 void Hardware_Interface::debugMode()
 {
     debug = true;
@@ -1273,44 +868,4 @@ void Hardware_Interface::leaveDebugMode()
     debug = false;
     cout << "Running Hardware Interface in regular mode" << endl;
 }
-void Hardware_Interface::setModule(string m)
-{
-    module = m;
-}
-
-void Hardware_Interface::closeTCPConnection() /////////////////////////////////////////TCIP Block
-{
-    for (int i = 0; i < 10; i++)
-    {
-        string msgToSend = "0\t0.000000\t\n";
-        this->sendWithTimeout(sock, msgToSend, 25000);
-
-        std::string response;
-        if (this->recvImmediate(sock, response, 2000, 50))
-        {
-            // cout << "First receive from protocol successful";
-        }
-        else
-        {
-            cerr << "No data received or error occurred\n";
-        }
-    }
-    for (int i = 0; i < 5; i++)
-    {
-        string msgToSend = "8\t0.500000\t\n";
-        this->sendWithTimeout(sock, msgToSend, 2000);
-
-        std::string response;
-        if (this->recvImmediate(sock, response, 25000, 50))
-        {
-            // cout << "First receive from protocol successful";
-        }
-        else
-        {
-            cerr << "No data received or error occurred\n";
-        }
-    }
-    // close it
-    close(sock);
-    cout << "[closeTCPConnection]TCP connection to arm has been closed" << endl;
-}
+void Hardware_Interface::setModule(string m) { module = m; }
