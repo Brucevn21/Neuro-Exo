@@ -4,6 +4,15 @@
 
 using namespace NeuroExoProtocol;
 
+// --- BLE packet-loss test mode ---
+// When enabled, incoming control frames are NOT forwarded to the Teensy.
+// Instead each frame's targetAngleDeg is treated as a 16-bit sequence number
+// (sender sends 0, 1, 2, ... wrapping at 65535) and the Nano tallies received,
+// lost, duplicate and out-of-order packets plus arrival timing. Telemetry
+// polling and PMS keep running so the radio/CPU load stays realistic.
+// Counters reset on connect; a final summary prints on disconnect.
+#define BLE_PACKET_TEST 0
+
 // This Nano 33 BLE plays two roles:
 //  1. Mediator: BLE peripheral toward the BeagleBone Black (BLE central) <-> I2C
 //     master toward the Teensy 4.1 motor controller.
@@ -114,6 +123,221 @@ void printReceivedCommand(const uint8_t *frame, uint8_t length, const ControlPac
   Serial.println(speedName(command.speed));
 }
 
+#if BLE_PACKET_TEST
+const unsigned long TEST_PROGRESS_INTERVAL_MS = 1000; // live progress line cadence
+const unsigned long TEST_IDLE_REPORT_MS = 2000;       // summary after this long with no packets
+
+// One bit per sequence number (mod 65536) to detect duplicates. Bits are
+// cleared as the highest sequence advances, so tests longer than 65536
+// packets work as long as reordering stays under ~32k packets.
+const uint32_t SEQ_WINDOW = 65536;
+uint8_t seenBitmap[SEQ_WINDOW / 8];
+
+struct PacketTestStats {
+  bool anyReceived;
+  uint32_t highestSeq;      // highest extended (unwrapped) sequence seen
+  uint32_t uniqueReceived;  // distinct sequence numbers received
+  uint32_t duplicates;
+  uint32_t outOfOrder;      // arrived after a higher sequence number (not dups)
+  uint32_t staleDropped;    // too far behind to place in the sequence window
+  uint32_t totalFrames;     // every valid control frame, including dups
+  uint32_t rejectedWrites;  // BLE writes that did not yield a valid control frame
+  uint32_t bleWrites;
+  uint32_t bytesReceived;
+  unsigned long firstUs;
+  unsigned long lastUs;
+  unsigned long minGapUs;
+  unsigned long maxGapUs;
+  uint64_t sumGapUs;
+  uint32_t gapCount;
+  unsigned long lastPacketMs;
+};
+
+PacketTestStats testStats;
+uint32_t lastProgressFrames = 0;
+unsigned long lastProgressTime = 0;
+bool idleReportPrinted = true;
+
+inline bool seqSeen(uint32_t seq) {
+  uint32_t idx = seq % SEQ_WINDOW;
+  return seenBitmap[idx >> 3] & (1 << (idx & 7));
+}
+
+inline void markSeq(uint32_t seq, bool value) {
+  uint32_t idx = seq % SEQ_WINDOW;
+  if (value) {
+    seenBitmap[idx >> 3] |= (1 << (idx & 7));
+  } else {
+    seenBitmap[idx >> 3] &= ~(1 << (idx & 7));
+  }
+}
+
+void resetTestStats() {
+  memset(&testStats, 0, sizeof(testStats));
+  memset(seenBitmap, 0, sizeof(seenBitmap));
+  testStats.minGapUs = 0xFFFFFFFF;
+  lastProgressFrames = 0;
+  lastProgressTime = millis();
+  idleReportPrinted = true;
+}
+
+uint32_t expectedPackets() {
+  // Inferred: sender starts at sequence 0, so expected = highest + 1.
+  // Packets dropped at the very end of a run cannot be detected this way.
+  return testStats.anyReceived ? testStats.highestSeq + 1 : 0;
+}
+
+uint32_t lostPackets() {
+  uint32_t expected = expectedPackets();
+  return expected > testStats.uniqueReceived ? expected - testStats.uniqueReceived : 0;
+}
+
+void recordTestPacket(uint16_t seq16) {
+  unsigned long nowUs = micros();
+  testStats.totalFrames++;
+  testStats.lastPacketMs = millis();
+  idleReportPrinted = false;
+
+  if (testStats.totalFrames == 1) {
+    testStats.firstUs = nowUs;
+  } else {
+    unsigned long gap = nowUs - testStats.lastUs;
+    if (gap < testStats.minGapUs) testStats.minGapUs = gap;
+    if (gap > testStats.maxGapUs) testStats.maxGapUs = gap;
+    testStats.sumGapUs += gap;
+    testStats.gapCount++;
+  }
+  testStats.lastUs = nowUs;
+
+  // Unwrap the 16-bit sequence against the highest seen so far.
+  int64_t seq;
+  if (!testStats.anyReceived) {
+    seq = seq16;
+  } else {
+    int16_t delta = (int16_t)(seq16 - (uint16_t)testStats.highestSeq);
+    seq = (int64_t)testStats.highestSeq + delta;
+  }
+  if (seq < 0) {
+    testStats.staleDropped++;
+    return;
+  }
+
+  if (!testStats.anyReceived || seq > testStats.highestSeq) {
+    // Clear bits being reused for the new range before marking this one.
+    uint32_t from = testStats.anyReceived ? testStats.highestSeq + 1 : 0;
+    uint32_t span = (uint32_t)seq - from + 1;
+    if (span >= SEQ_WINDOW) {
+      memset(seenBitmap, 0, sizeof(seenBitmap));
+    } else {
+      for (uint32_t s = from; s <= (uint32_t)seq; ++s) {
+        markSeq(s, false);
+      }
+    }
+    testStats.highestSeq = (uint32_t)seq;
+    testStats.anyReceived = true;
+  } else if (seqSeen((uint32_t)seq)) {
+    testStats.duplicates++;
+    return;
+  } else {
+    testStats.outOfOrder++;
+  }
+
+  markSeq((uint32_t)seq, true);
+  testStats.uniqueReceived++;
+}
+
+// Runs inside the BLE stack's poll for every write, so back-to-back writes
+// processed in a single poll are each counted (written() would only report
+// the latest value and hide them as "lost").
+void onTestCommandWritten(BLEDevice central, BLECharacteristic characteristic) {
+  uint8_t bytes[MAX_FRAME_SIZE];
+  int len = characteristic.readValue(bytes, MAX_FRAME_SIZE);
+  testStats.bleWrites++;
+  if (len > 0) testStats.bytesReceived += len;
+
+  unsigned long now = millis();
+  if (now - lastCommandByteTime > FRAME_TIMEOUT_MS) {
+    commandParser.reset();
+  }
+  lastCommandByteTime = now;
+
+  if (len <= 0 || len > MAX_FRAME_SIZE) {
+    testStats.rejectedWrites++;
+    return;
+  }
+  for (int i = 0; i < len; ++i) {
+    commandParser.push(bytes[i]);
+  }
+  Frame frame;
+  ControlPacket command;
+  if (commandParser.takeFrame(frame) && decodeControlFrame(frame, command)) {
+    recordTestPacket((uint16_t)command.targetAngleDeg);
+  } else {
+    testStats.rejectedWrites++;
+  }
+}
+
+void printTestSummary(const char *label) {
+  uint32_t expected = expectedPackets();
+  uint32_t lost = lostPackets();
+  float lossPct = expected ? (100.0f * lost / expected) : 0.0f;
+  float durationS = testStats.totalFrames > 1 ? (testStats.lastUs - testStats.firstUs) / 1e6f : 0.0f;
+
+  Serial.println();
+  Serial.print("===== BLE Packet Test: ");
+  Serial.print(label);
+  Serial.println(" =====");
+  Serial.print("Expected (highest seq + 1): "); Serial.println(expected);
+  Serial.print("Received (unique):          "); Serial.println(testStats.uniqueReceived);
+  Serial.print("Lost:                       "); Serial.println(lost);
+  Serial.print("Loss:                       "); Serial.print(lossPct, 3); Serial.println(" %");
+  Serial.print("Duplicates:                 "); Serial.println(testStats.duplicates);
+  Serial.print("Out-of-order:               "); Serial.println(testStats.outOfOrder);
+  Serial.print("Stale (outside window):     "); Serial.println(testStats.staleDropped);
+  Serial.print("Rejected writes (bad frame):"); Serial.print(' '); Serial.println(testStats.rejectedWrites);
+  Serial.print("BLE writes / bytes:         ");
+  Serial.print(testStats.bleWrites); Serial.print(" / "); Serial.println(testStats.bytesReceived);
+  Serial.print("Duration:                   "); Serial.print(durationS, 3); Serial.println(" s");
+  if (durationS > 0.0f) {
+    Serial.print("Throughput:                 ");
+    Serial.print(testStats.totalFrames / durationS, 1); Serial.print(" pkt/s, ");
+    Serial.print(testStats.bytesReceived / durationS, 1); Serial.println(" B/s");
+  }
+  if (testStats.gapCount > 0) {
+    Serial.print("Inter-arrival min/avg/max:  ");
+    Serial.print(testStats.minGapUs); Serial.print(" / ");
+    Serial.print((unsigned long)(testStats.sumGapUs / testStats.gapCount)); Serial.print(" / ");
+    Serial.print(testStats.maxGapUs); Serial.println(" us");
+  }
+  Serial.println("==========================================");
+}
+
+// Live progress + idle summary; called from the connected loop.
+void servicePacketTest() {
+  unsigned long now = millis();
+  if (now - lastProgressTime >= TEST_PROGRESS_INTERVAL_MS) {
+    lastProgressTime = now;
+    if (testStats.totalFrames != lastProgressFrames) {
+      uint32_t rate = testStats.totalFrames - lastProgressFrames;
+      lastProgressFrames = testStats.totalFrames;
+      Serial.print("[Test] rx="); Serial.print(testStats.uniqueReceived);
+      Serial.print(" expected="); Serial.print(expectedPackets());
+      Serial.print(" lost="); Serial.print(lostPackets());
+      Serial.print(" dup="); Serial.print(testStats.duplicates);
+      Serial.print(" ooo="); Serial.print(testStats.outOfOrder);
+      Serial.print(" bad="); Serial.print(testStats.rejectedWrites);
+      Serial.print(" rate="); Serial.print(rate); Serial.println(" pkt/s");
+    }
+  }
+
+  if (!idleReportPrinted && testStats.totalFrames > 0 &&
+      now - testStats.lastPacketMs >= TEST_IDLE_REPORT_MS) {
+    idleReportPrinted = true;
+    printTestSummary("idle (still connected)");
+  }
+}
+#endif
+
 void setup() {
   // Relay defaults OFF for safety until the rail voltage is verified.
   pinMode(PMS_RELAY_PIN, OUTPUT);
@@ -129,12 +353,22 @@ void setup() {
 
   BLE.setLocalName("Nano33BLE_Master");
   BLE.setAdvertisedService(jointService);
+  // Request a 7.5-15 ms connection interval (units of 1.25 ms) so 20 ms
+  // telemetry notifications aren't batched and dropped by a slower link.
+  BLE.setConnectionInterval(6, 12);
   jointService.addCharacteristic(commandChar);
   jointService.addCharacteristic(telemetryChar);
   BLE.addService(jointService);
+#if BLE_PACKET_TEST
+  commandChar.setEventHandler(BLEWritten, onTestCommandWritten);
+#endif
   BLE.advertise();
 
   Serial.println("System Ready.");
+#if BLE_PACKET_TEST
+  Serial.println("BLE PACKET TEST MODE: commands are counted, NOT forwarded to the Teensy.");
+  Serial.println("Sender: control frames with targetAngleDeg = 0,1,2,... (one frame per write).");
+#endif
 }
 
 void forwardCommandToTeensy(const uint8_t *frame, uint8_t length) {
@@ -178,10 +412,18 @@ void loop() {
   if (central) {
     Serial.print("Central connected: ");
     Serial.println(central.address());
+    lastTelemetryTime = millis();
+#if BLE_PACKET_TEST
+    commandParser.reset();
+    resetTestStats();
+#endif
 
     while (central.connected()) {
       checkPowerSupply();
 
+#if BLE_PACKET_TEST
+      servicePacketTest();
+#else
       if (commandChar.written()) {
         uint8_t bytes[MAX_FRAME_SIZE];
         int len = commandChar.readValue(bytes, MAX_FRAME_SIZE);
@@ -204,13 +446,17 @@ void loop() {
           }
         }
       }
+#endif
 
       if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
-        lastTelemetryTime = millis();
+        lastTelemetryTime += TELEMETRY_INTERVAL_MS;
         pollTeensyTelemetry();
       }
     }
 
     Serial.println("Central disconnected");
+#if BLE_PACKET_TEST
+    printTestSummary("final (disconnected)");
+#endif
   }
 }
