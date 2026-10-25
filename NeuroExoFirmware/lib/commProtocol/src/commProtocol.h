@@ -9,6 +9,7 @@ constexpr uint8_t START_BYTE = 0x02;
 constexpr uint8_t STOP_BYTE = 0x03;
 constexpr uint8_t MESSAGE_CONTROL = 0x10;
 constexpr uint8_t MESSAGE_TELEMETRY = 0x11;
+constexpr uint8_t MESSAGE_STOP = 0x12;
 constexpr uint8_t CONTROL_PAYLOAD_SIZE = 4;
 constexpr uint8_t TELEMETRY_PAYLOAD_SIZE = 5;
 constexpr uint8_t FRAME_OVERHEAD = 5;
@@ -22,7 +23,9 @@ enum class TelemetryStatus : uint8_t {
     MotionActive = 1 << 0,
     CommandTimeout = 1 << 1,
     InvalidCommand = 1 << 2,
-    SafetyFault = 1 << 3
+    SafetyFault = 1 << 3,
+    TargetReached = 1 << 4,  // Last trial ended at its target
+    TrialTimeout = 1 << 5    // Last trial was aborted by the trial time limit
 };
 
 enum class Mode : uint8_t {
@@ -58,7 +61,9 @@ struct Frame {
 uint8_t crc8(const uint8_t *data, uint8_t length);
 uint8_t encodeControlFrame(const ControlPacket &packet, uint8_t *frame);
 uint8_t encodeTelemetryFrame(const TelemetryPacket &packet, uint8_t *frame);
+uint8_t encodeStopFrame(uint8_t *frame);
 bool decodeControlFrame(const Frame &frame, ControlPacket &packet);
+bool isStopFrame(const Frame &frame);
 bool decodeTelemetryFrame(const Frame &frame, TelemetryPacket &packet);
 
 class FrameParser {

@@ -29,9 +29,18 @@ volatile bool i2cReceiveReady = false;
 uint8_t telemetryBuffers[2][NeuroExoProtocol::MAX_FRAME_SIZE] = {};
 volatile uint8_t activeTelemetryBuffer = 0;
 volatile uint8_t telemetryFrameLength = 0;
-unsigned long lastValidCommandTime = 0;
-bool commandTimedOut = true;
 bool invalidCommand = false;
+
+// ---- Trial state ----
+// A single control packet starts a trial; it ends when the joint reaches the
+// target, a stop packet arrives, a safety fault trips, or the time limit
+// (trajectory duration + margin) expires. motorMotionActive is "trial active".
+const float TRIAL_TARGET_TOLERANCE_DEG = 2.0f;
+const unsigned long TRIAL_TIMEOUT_MARGIN_MS = 5000;
+unsigned long trialStartMs = 0;
+unsigned long trialTimeLimitMs = 0;
+volatile bool trialTargetReached = false;
+bool trialTimedOut = false;
 
 motorWiring_t motorWiring;
 motorLimit_t motorLimit;
@@ -65,10 +74,10 @@ const unsigned long DEBUG_INTERVAL_MS = 2000;
 // fraction of the controller's max current that may be commanded.
 int interpCyclesForSpeed(NeuroExoProtocol::Speed speed) {
     switch (speed) {
-        case NeuroExoProtocol::Speed::Slow:   return 60000;
-        case NeuroExoProtocol::Speed::High:   return 1750;
-        case NeuroExoProtocol::Speed::Medium:
-        default:                              return 9000;
+        case NeuroExoProtocol::Speed::Slow:   return 10000;  // 20 s at 2 ms per cycle
+        case NeuroExoProtocol::Speed::High:   return 3000;   // 6 s
+        case NeuroExoProtocol::Speed::Medium: return 6000;   // 12 s
+        default:                              return 6000;
     }
 }
 
@@ -96,7 +105,7 @@ const float VELOCITY_FILTER_ALPHA = 0.2f;
 const float ACCEL_FILTER_ALPHA = 0.1f;
 unsigned long lastStreamTime = 0;
 const unsigned long STREAM_INTERVAL_MS = 20; // 50 Hz feed for the live visualizer
-const bool STREAM_JOINT_CSV = false;          // true to feed the live visualizer
+const bool STREAM_JOINT_CSV = true;           // true to feed the live visualizer
 
 // ESCON analog out 1: 0 V = -7 A, 1.65 V = 0 A, 3.3 V = +7 A.
 const float CURRENT_SENSOR_ZERO_V = 1.65f;
@@ -109,7 +118,7 @@ const float CONTROL_DT_S = 0.002f;            // motorControlTimer period
 const float RAD_PER_DEG = 0.01745329f;
 // ESCON Studio current set-value at 90 % PWM duty. MUST be set to match the
 // ESCON configuration; while 0 the controller stays off and the motor is never enabled.
-const float ESCON_FULL_SCALE_CURRENT_A = 0.0f;
+const float ESCON_FULL_SCALE_CURRENT_A = 3.29f;
 const float ASSISTIVE_ASSISTANCE = 0.7f;      // Assistive mode: robot gives 70 % of required torque
 const float NEUTRAL_ASSISTANCE = 1.0f;        // Neutral mode: robot does all the work (passive motion)
 const float NEUTRAL_MAX_TRACKING_ERROR_DEG = 10.0f;  // Neutral only; patient-driven modes lag by design
@@ -132,8 +141,8 @@ NeuroExoControl::ControlConfig makeControlConfig() {
     return cfg;
 }
 
-// Set when the controller or the Neutral tracking check faults. Motion
-// commands are ignored until the command stream goes quiet (timeout).
+// Set when the controller or the Neutral tracking check faults. Control
+// packets are ignored until a stop packet clears it.
 volatile bool safetyEstopLatched = false;
 volatile NeuroExoControl::EstopReason lastEstopReason = NeuroExoControl::EstopReason::None;
 volatile float commandedCurrentA = 0.0f;
@@ -157,7 +166,12 @@ void motorControlISR() {
         setPointInterpolated += interpIncrement;
         interpCounter++;
     } else if (motorMotionActive) {
+        // Trajectory finished: hold the setpoint on the target until the joint arrives.
         setPointInterpolated = interpolateEnd;
+    }
+
+    if (motorMotionActive && fabsf(encDeg - interpolateEnd) <= TRIAL_TARGET_TOLERANCE_DEG) {
+        trialTargetReached = true;
         motorMotionActive = false;
         interpInitialized = false;
     }
@@ -258,7 +272,27 @@ void processI2CCommand() {
     }
     NeuroExoProtocol::Frame frame;
     NeuroExoProtocol::ControlPacket packet;
-    if (!parser.takeFrame(frame) || !NeuroExoProtocol::decodeControlFrame(frame, packet)) {
+    if (!parser.takeFrame(frame)) {
+        invalidCommand = true;
+        Serial.print("[Teensy] Invalid command frame (");
+        Serial.print(localLength);
+        Serial.println(" bytes)");
+        return;
+    }
+
+    if (NeuroExoProtocol::isStopFrame(frame)) {
+        invalidCommand = false;
+        // Stop ends any trial and acknowledges a latched E-stop.
+        noInterrupts();
+        motorMotionActive = false;
+        interpInitialized = false;
+        safetyEstopLatched = false;
+        interrupts();
+        Serial.println("[Teensy] Stop received - trial ended");
+        return;
+    }
+
+    if (!NeuroExoProtocol::decodeControlFrame(frame, packet)) {
         invalidCommand = true;
         Serial.print("[Teensy] Invalid command frame (");
         Serial.print(localLength);
@@ -274,18 +308,28 @@ void processI2CCommand() {
     Serial.println((int)packet.speed);
 
     invalidCommand = false;
-    lastValidCommandTime = millis();
-    commandTimedOut = false;
     if (safetyEstopLatched) {
-        Serial.println("[Teensy] Ignored: safety E-stop latched");
+        Serial.println("[Teensy] Ignored: safety E-stop latched (send stop to clear)");
         return;
     }
+    if (motorMotionActive) {
+        Serial.println("[Teensy] Ignored: trial in progress (send stop first)");
+        return;
+    }
+
+    noInterrupts();
     lastCommandedMode = packet.mode;
     lastCommandedSpeed = packet.speed;
-    motorMotionActive = true;
     interpolateEnd = (float)packet.targetAngleDeg;
     interpCycles = interpCyclesForSpeed(packet.speed);
     interpInitialized = false;
+    trialTargetReached = false;
+    trialTimedOut = false;
+    trialStartMs = millis();
+    trialTimeLimitMs = (unsigned long)(interpCycles * CONTROL_DT_S * 1000.0f) + TRIAL_TIMEOUT_MARGIN_MS;
+    motorMotionActive = true;
+    interrupts();
+    Serial.println("[Teensy] Trial started");
 }
 
 void updateTelemetryFrame() {
@@ -296,8 +340,11 @@ void updateTelemetryFrame() {
     if (motorMotionActive) {
         packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::MotionActive);
     }
-    if (commandTimedOut) {
-        packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::CommandTimeout);
+    if (trialTargetReached) {
+        packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::TargetReached);
+    }
+    if (trialTimedOut) {
+        packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::TrialTimeout);
     }
     if (safetyEstopLatched) {
         packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::SafetyFault);
@@ -352,7 +399,6 @@ void setup() {
     Wire.begin(SLAVE_ADDR);
     Wire.onReceive(receiveEvent);
     Wire.onRequest(requestEvent);
-    lastValidCommandTime = millis();
     updateTelemetryFrame();
 
     Serial.println("========================================");
@@ -377,10 +423,15 @@ void loop() {
     unsigned long currentTime = millis();
 
     processI2CCommand();
-    if (currentTime - lastValidCommandTime > NeuroExoProtocol::COMMAND_TIMEOUT_MS) {
-        commandTimedOut = true;
+    noInterrupts();
+    const bool timeLimitHit = motorMotionActive && millis() - trialStartMs > trialTimeLimitMs;
+    if (timeLimitHit) {
         motorMotionActive = false;
-        safetyEstopLatched = false;
+        trialTimedOut = true;
+    }
+    interrupts();
+    if (timeLimitHit) {
+        Serial.println("[Teensy] Trial aborted - time limit exceeded");
     }
 
     encBinary = myAS5045.read();

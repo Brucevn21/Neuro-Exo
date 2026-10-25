@@ -41,6 +41,14 @@ uint8_t encodeTelemetryFrame(const TelemetryPacket &packet, uint8_t *frame) {
     return encodeFrame(MESSAGE_TELEMETRY, payload, TELEMETRY_PAYLOAD_SIZE, frame);
 }
 
+uint8_t encodeStopFrame(uint8_t *frame) {
+    return encodeFrame(MESSAGE_STOP, nullptr, 0, frame);
+}
+
+bool isStopFrame(const Frame &frame) {
+    return frame.type == MESSAGE_STOP && frame.length == 0;
+}
+
 bool decodeControlFrame(const Frame &frame, ControlPacket &packet) {
     if (frame.type != MESSAGE_CONTROL || frame.length != CONTROL_PAYLOAD_SIZE ||
         frame.payload[0] > static_cast<uint8_t>(Mode::Neutral) ||

@@ -371,15 +371,30 @@ void setup() {
 #endif
 }
 
-void forwardCommandToTeensy(const uint8_t *frame, uint8_t length) {
-  Wire.beginTransmission(SLAVE_ADDR);
-  Wire.write(frame, length);
-  byte error = Wire.endTransmission();
+// A trial starts or stops on a single frame, so retry a failed write rather
+// than relying on the next packet in a stream.
+const uint8_t I2C_SEND_ATTEMPTS = 3;
 
-  if (error != 0) {
+void forwardCommandToTeensy(const uint8_t *frame, uint8_t length) {
+  for (uint8_t attempt = 1; attempt <= I2C_SEND_ATTEMPTS; ++attempt) {
+    Wire.beginTransmission(SLAVE_ADDR);
+    Wire.write(frame, length);
+    byte error = Wire.endTransmission();
+    if (error == 0) {
+      return;
+    }
     Serial.print("I2C Error: ");
-    Serial.println(error);
+    Serial.print(error);
+    Serial.print(" (attempt ");
+    Serial.print(attempt);
+    Serial.println(")");
   }
+}
+
+void forwardStopToTeensy() {
+  uint8_t encoded[MAX_FRAME_SIZE];
+  uint8_t frameLength = encodeStopFrame(encoded);
+  forwardCommandToTeensy(encoded, frameLength);
 }
 
 void pollTeensyTelemetry() {
@@ -438,11 +453,16 @@ void loop() {
           }
           Frame frame;
           ControlPacket command;
-          if (commandParser.takeFrame(frame) && decodeControlFrame(frame, command)) {
-            uint8_t encoded[MAX_FRAME_SIZE];
-            uint8_t frameLength = encodeControlFrame(command, encoded);
-            printReceivedCommand(encoded, frameLength, command);
-            forwardCommandToTeensy(encoded, frameLength);
+          if (commandParser.takeFrame(frame)) {
+            if (decodeControlFrame(frame, command)) {
+              uint8_t encoded[MAX_FRAME_SIZE];
+              uint8_t frameLength = encodeControlFrame(command, encoded);
+              printReceivedCommand(encoded, frameLength, command);
+              forwardCommandToTeensy(encoded, frameLength);
+            } else if (isStopFrame(frame)) {
+              Serial.println("[Bridge] Stop received from host");
+              forwardStopToTeensy();
+            }
           }
         }
       }
@@ -457,6 +477,11 @@ void loop() {
     Serial.println("Central disconnected");
 #if BLE_PACKET_TEST
     printTestSummary("final (disconnected)");
+#else
+    // Trials no longer need a command stream, so a dropped link must end the
+    // trial explicitly or the arm keeps moving with no one able to stop it.
+    Serial.println("[Bridge] Sending stop to Teensy (link lost)");
+    forwardStopToTeensy();
 #endif
   }
 }
