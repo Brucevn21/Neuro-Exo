@@ -48,7 +48,27 @@ Optional flags:
 - `--no-log`: disable trial logging.
 
 The window shows the rotating joint link (blue = current angle, red dashed =
-commanded target), plus live angle and velocity time-series plots.
+commanded target), plus angle and velocity time-series plots.
+
+The arm and plots only update while a trial is running (`motionActive=1`). Each
+new trial clears the plots and starts at t = 0 (device time), and the plots show
+the whole trial. When the trial ends the display freezes on it until the next
+trial starts; the status line keeps updating so you can see the link is alive.
+
+## 3D visualizer
+
+`joint_visualizer_3d.py` shows the same data as a simple 3D elbow brace: a fixed
+upper arm, the motor hub on the elbow axis, and a forearm that rotates about it.
+The red dashed line is the trial target and the orange line is the moving
+setpoint, with an angle-vs-time plot beside it. Drag to rotate the view and
+right-drag or scroll to zoom. It takes the same options, follows the same trial
+behavior and writes the same trial CSVs as the 2D visualizer:
+
+```bash
+python joint_visualizer_3d.py --port /dev/ttyACM1 --baud 115200
+```
+
+Run only one visualizer at a time; both need the Teensy's serial port.
 
 ## Trial CSV logging
 
