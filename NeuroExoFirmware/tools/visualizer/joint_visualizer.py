@@ -4,8 +4,9 @@ Live serial visualizer for the NeuroExo joint.
 
 Reads the "JOINT,<enc>,<setpoint>,<target>,<Vc>,<vel>,<active>,<acc>,<currentA>,<ms>"
 CSV lines streamed by src/main.cpp (see STREAM_INTERVAL_MS) over a serial port
-and renders the joint as a rotating single-link arm, plus plots of angle and
-velocity. The arm and plots only update while a trial is running (motionActive=1);
+and renders the joint in one window: a 3D elbow brace (fixed upper arm, motor hub,
+rotating forearm; drag to rotate, scroll to zoom), a 2D arm view, a readout, and
+plots of angle and velocity. The views only update while a trial is running (motionActive=1);
 each trial starts a fresh plot at t = 0 and the last trial stays on screen until
 the next one begins. Active trials are logged to CSV (see trial_logger.py).
 
@@ -32,6 +33,8 @@ DEFAULT_MIN_DEG = -150.0
 DEFAULT_MAX_DEG = 80.0
 MIN_PLOT_SECONDS = 5.0  # x-axis span before a trial grows past it
 DEFAULT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry_data")
+ELBOW_AXIS = np.array([0.0, 1.0, 0.0])  # the 3D joint rotates about +y
+UPPER_ARM_DEG = 180.0                   # fixed upper arm, outside the joint's travel
 
 
 def parse_args():
@@ -135,7 +138,6 @@ class TrialTracker:
 
     The display only follows the joint while motion_active=1. A new trial clears
     the history and restarts time at 0; after it ends the last values are kept.
-    Shared by the 2D and 3D visualizers.
     """
 
     def __init__(self, stream, logger):
@@ -227,42 +229,111 @@ def open_stream(args):
     return stream, logger
 
 
+def direction(angle_deg):
+    """Unit vector in the x-z plane for a joint angle (0 deg = +x, positive toward +z)."""
+    a = np.radians(angle_deg)
+    return np.array([np.cos(a), 0.0, np.sin(a)])
+
+
+def cylinder(p0, p1, radius, segments=20):
+    """Surface grid (X, Y, Z) for a cylinder from p0 to p1."""
+    axis = p1 - p0
+    unit = axis / np.linalg.norm(axis)
+    helper = np.array([1.0, 0.0, 0.0]) if abs(unit[1]) > 0.9 else ELBOW_AXIS
+    e1 = np.cross(unit, helper)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(unit, e1)
+    theta = np.linspace(0, 2 * np.pi, segments)
+    ring = radius * (np.outer(e1, np.cos(theta)) + np.outer(e2, np.sin(theta)))  # (3, segments)
+    along = np.array([0.0, 1.0])
+    grid = p0[:, None, None] + axis[:, None, None] * along[None, None, :] + ring[:, :, None]
+    return grid[0], grid[1], grid[2]
+
+
 def main():
     args = parse_args()
     stream, logger = open_stream(args)
     trial = TrialTracker(stream, logger)
+    length = args.link_length
+    origin = np.zeros(3)
 
-    fig, (ax_arm, ax_angle, ax_vel) = plt.subplots(1, 3, figsize=(13, 4.5))
+    fig = plt.figure(figsize=(15, 7.5))
     fig.suptitle(f"NeuroExo Joint Live Visualizer ({args.port} @ {args.baud})")
+    grid = fig.add_gridspec(2, 3, width_ratios=[1.5, 1, 1.2])
+    ax3d = fig.add_subplot(grid[:, 0], projection="3d")
+    ax_arm = fig.add_subplot(grid[0, 1])
+    ax_text = fig.add_subplot(grid[1, 1])
+    ax_angle = fig.add_subplot(grid[0, 2])
+    ax_vel = fig.add_subplot(grid[1, 2])
+    ax_text.axis("off")
 
-    # --- Arm view ---
+    # --- 3D brace view ---
+    span = 1.3 * length
+    ax3d.set_title("3D View")
+    ax3d.set_xlim(-span, span)
+    ax3d.set_ylim(-span, span)
+    ax3d.set_zlim(-span, span)
+    ax3d.set_box_aspect((1, 1, 1))
+    ax3d.set_xlabel("x")
+    ax3d.set_ylabel("y (elbow axis)")
+    ax3d.set_zlabel("z")
+    ax3d.view_init(elev=20, azim=-65)
+
+    hub_half = 0.15 * length
+    ax3d.plot_surface(*cylinder(-hub_half * ELBOW_AXIS, hub_half * ELBOW_AXIS, 0.12 * length),
+                      color="dimgray", alpha=0.9, linewidth=0, edgecolor="none")
+    ax3d.plot_surface(*cylinder(origin, length * direction(UPPER_ARM_DEG), 0.08 * length),
+                      color="silver", alpha=0.8, linewidth=0, edgecolor="none")
+    limit_arc = np.array([direction(d) for d in np.linspace(args.min_deg, args.max_deg, 60)])
+    limit_arc *= length * 1.05
+    ax3d.plot(limit_arc[:, 0], limit_arc[:, 1], limit_arc[:, 2], color="gray", linewidth=1, alpha=0.5)
+    (target_ray,) = ax3d.plot([], [], [], "r--", linewidth=1.5, label="Target")
+    (setpoint_ray,) = ax3d.plot([], [], [], color="orange", linewidth=1.5, label="Setpoint")
+    ax3d.legend(loc="upper left", fontsize=8)
+    forearm = {"surface": None, "hand": None}
+
+    def draw_ray(line, angle_deg, scale):
+        end = direction(angle_deg) * length * scale
+        line.set_data_3d([0, end[0]], [0, end[1]], [0, end[2]])
+
+    def draw_forearm(angle_deg):
+        for artist in forearm.values():
+            if artist is not None:
+                artist.remove()
+        end = direction(angle_deg) * length
+        forearm["surface"] = ax3d.plot_surface(*cylinder(origin, end, 0.07 * length), color="tab:blue",
+                                               alpha=0.95, linewidth=0, edgecolor="none")
+        forearm["hand"] = ax3d.scatter(*end, color="navy", s=80, depthshade=False)
+
+    draw_forearm(0.0)
+
+    # --- 2D arm view ---
     ax_arm.set_xlim(-1.3, 1.3)
     ax_arm.set_ylim(-1.3, 1.3)
     ax_arm.set_aspect("equal")
     ax_arm.set_title("Joint Angle")
     ax_arm.grid(True, linestyle=":", alpha=0.5)
-    (base_dot,) = ax_arm.plot(0, 0, "ko", markersize=8)
-    (link_line,) = ax_arm.plot([0, args.link_length], [0, 0], "b-", linewidth=4, solid_capstyle="round")
+    ax_arm.plot(0, 0, "ko", markersize=8)
+    (link_line,) = ax_arm.plot([0, length], [0, 0], "b-", linewidth=4, solid_capstyle="round")
     (target_line,) = ax_arm.plot([], [], "r--", linewidth=1.5, alpha=0.7)
-    angle_text = ax_arm.text(0.02, 0.95, "", transform=ax_arm.transAxes, fontsize=10, va="top")
 
     # Draw joint limit wedge for reference.
     limit_angles = np.linspace(np.radians(args.min_deg), np.radians(args.max_deg), 50)
-    ax_arm.plot(
-        np.cos(limit_angles) * args.link_length * 1.05,
-        np.sin(limit_angles) * args.link_length * 1.05,
-        color="gray",
-        linewidth=1,
-        alpha=0.4,
-    )
+    ax_arm.plot(np.cos(limit_angles) * length * 1.05, np.sin(limit_angles) * length * 1.05,
+                color="gray", linewidth=1, alpha=0.4)
+
+    readout = ax_text.text(0.02, 0.95, "", transform=ax_text.transAxes, fontsize=11,
+                           va="top", family="monospace")
 
     # --- Angle history ---
     ax_angle.set_title("Angle (deg) vs Trial Time")
     ax_angle.set_xlabel("Time (s)")
     ax_angle.set_ylabel("deg")
     ax_angle.grid(True, linestyle=":", alpha=0.5)
+    ax_angle.set_xlim(0, MIN_PLOT_SECONDS)
+    ax_angle.set_ylim(args.min_deg - 10, args.max_deg + 10)
     (angle_line,) = ax_angle.plot([], [], "b-", label="Encoder")
-    (setpoint_line,) = ax_angle.plot([], [], "r--", label="Setpoint")
+    (setpoint_line,) = ax_angle.plot([], [], color="orange", linestyle="--", label="Setpoint")
     ax_angle.legend(loc="upper right", fontsize=8)
 
     # --- Velocity history ---
@@ -270,39 +341,32 @@ def main():
     ax_vel.set_xlabel("Time (s)")
     ax_vel.set_ylabel("deg/s")
     ax_vel.grid(True, linestyle=":", alpha=0.5)
+    ax_vel.set_xlim(0, MIN_PLOT_SECONDS)
     (vel_line,) = ax_vel.plot([], [], "g-")
 
     fig.tight_layout()
 
     def update(_frame):
-        trial_changed = trial.poll()
+        if trial.poll():
+            draw_forearm(trial.arm_deg)
+            draw_ray(target_ray, trial.target_deg, 1.15)
+            draw_ray(setpoint_ray, trial.setpoint_hist[-1], 1.0)
 
-        if trial_changed:
             angle_rad = np.radians(trial.arm_deg)
-            link_line.set_data([0, args.link_length * np.cos(angle_rad)],
-                               [0, args.link_length * np.sin(angle_rad)])
+            link_line.set_data([0, length * np.cos(angle_rad)], [0, length * np.sin(angle_rad)])
             target_rad = np.radians(trial.target_deg)
-            target_line.set_data(
-                [0, args.link_length * 1.15 * np.cos(target_rad)],
-                [0, args.link_length * 1.15 * np.sin(target_rad)],
-            )
+            target_line.set_data([0, length * 1.15 * np.cos(target_rad)],
+                                 [0, length * 1.15 * np.sin(target_rad)])
 
-        angle_text.set_text(trial.readout_text())
-
-        if trial_changed and trial.time_hist:
             angle_line.set_data(trial.time_hist, trial.angle_hist)
             setpoint_line.set_data(trial.time_hist, trial.setpoint_hist)
             vel_line.set_data(trial.time_hist, trial.vel_hist)
-
             for ax in (ax_angle, ax_vel):
                 ax.set_xlim(0, max(MIN_PLOT_SECONDS, trial.time_hist[-1]))
-            ax_angle.set_ylim(args.min_deg - 10, args.max_deg + 10)
-            if trial.vel_hist:
-                vmin, vmax = min(trial.vel_hist), max(trial.vel_hist)
-                pad = max(5.0, (vmax - vmin) * 0.1)
-                ax_vel.set_ylim(vmin - pad, vmax + pad)
-
-        return link_line, target_line, angle_text, angle_line, setpoint_line, vel_line
+            vmin, vmax = min(trial.vel_hist), max(trial.vel_hist)
+            pad = max(5.0, (vmax - vmin) * 0.1)
+            ax_vel.set_ylim(vmin - pad, vmax + pad)
+        readout.set_text(trial.readout_text())
 
     ani = animation.FuncAnimation(fig, update, interval=40, blit=False, cache_frame_data=False)
 
