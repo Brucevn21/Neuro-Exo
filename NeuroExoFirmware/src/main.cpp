@@ -23,6 +23,10 @@ volatile bool triggerMotor = false;
 
 volatile NeuroExoProtocol::Mode lastCommandedMode = NeuroExoProtocol::Mode::Neutral;
 volatile NeuroExoProtocol::Speed lastCommandedSpeed = NeuroExoProtocol::Speed::Medium;
+volatile uint8_t lastCommandedSetting = 0;      // raw setting byte, for logging
+volatile float effortLevel = 0.5f;              // Assistive/Resistive level, 0.1..0.9
+volatile float patientEffortNm = 0.0f;          // latest effort estimate (effort modes)
+volatile float trialDir = 1.0f;                 // +1 / -1 travel direction of the trial
 volatile uint8_t i2cReceiveBuffer[32];
 volatile uint8_t i2cReceiveLength = 0;
 volatile bool i2cReceiveReady = false;
@@ -33,14 +37,22 @@ bool invalidCommand = false;
 
 // ---- Trial state ----
 // A single control packet starts a trial; it ends when the joint reaches the
-// target, a stop packet arrives, a safety fault trips, or the time limit
-// (trajectory duration + margin) expires. motorMotionActive is "trial active".
+// target, a stop packet arrives, a safety fault trips, an Assistive patient
+// resists, or the time limit expires (move time at the slowest speed the mode
+// can run + margin). A Calibrate trial ends when its sweep is done.
+// motorMotionActive is "trial active".
 const float TRIAL_TARGET_TOLERANCE_DEG = 2.0f;
 const unsigned long TRIAL_TIMEOUT_MARGIN_MS = 5000;
+const float CALIBRATION_MIN_RANGE_DEG = 10.0f;
+const unsigned long CALIBRATION_PASS_MARGIN_MS = 3000;  // accelerating / settling per pass
 unsigned long trialStartMs = 0;
 unsigned long trialTimeLimitMs = 0;
 volatile bool trialTargetReached = false;
 bool trialTimedOut = false;
+volatile bool trialPatientResisting = false;   // last Assistive trial aborted on resistance
+// One-shot events from the control ISR, reported by loop().
+volatile bool calibrationFinishedEvent = false;
+volatile bool resistanceAbortEvent = false;
 
 motorWiring_t motorWiring;
 motorLimit_t motorLimit;
@@ -70,8 +82,8 @@ volatile bool motorMotionActive = false;
 unsigned long lastDebugTime = 0;
 const unsigned long DEBUG_INTERVAL_MS = 2000;
 
-// Speed setting controls both trajectory duration (interpCycles) and the
-// fraction of the controller's max current that may be commanded.
+// Neutral speed setting controls both trajectory duration (interpCycles) and
+// the fraction of the controller's max current that may be commanded.
 int interpCyclesForSpeed(NeuroExoProtocol::Speed speed) {
     switch (speed) {
         case NeuroExoProtocol::Speed::Slow:   return 10000;  // 20 s at 2 ms per cycle
@@ -119,9 +131,8 @@ const float RAD_PER_DEG = 0.01745329f;
 // ESCON Studio current set-value at 90 % PWM duty. MUST be set to match the
 // ESCON configuration; while 0 the controller stays off and the motor is never enabled.
 const float ESCON_FULL_SCALE_CURRENT_A = 3.29f;
-const float ASSISTIVE_ASSISTANCE = 0.7f;      // Assistive mode: robot gives 70 % of required torque
 const float NEUTRAL_ASSISTANCE = 1.0f;        // Neutral mode: robot does all the work (passive motion)
-const float NEUTRAL_MAX_TRACKING_ERROR_DEG = 10.0f;  // Neutral only; patient-driven modes lag by design
+const float NEUTRAL_MAX_TRACKING_ERROR_DEG = 10.0f;  // Neutral only
 
 NeuroExoControl::ControlConfig makeControlConfig() {
     NeuroExoControl::ControlConfig cfg;
@@ -130,7 +141,6 @@ NeuroExoControl::ControlConfig makeControlConfig() {
     cfg.kdNmSPerRad = 1.0f;
     cfg.massKg = 0.0f;                        // Set limb + brace mass to enable gravity compensation
     cfg.centerOfMassM = 0.0f;
-    cfg.resistDampingNmSPerRad = 2.0f;
     cfg.softVelocityLimitRadPerSec = 90.0f * RAD_PER_DEG;
     cfg.overspeedDampingNmSPerRad = 3.0f;
     cfg.hardVelocityLimitRadPerSec = 300.0f * RAD_PER_DEG;
@@ -138,7 +148,37 @@ NeuroExoControl::ControlConfig makeControlConfig() {
     cfg.maxCurrentA = 2.0f;                   // ~11 N*m at the joint
     cfg.overcurrentTripA = 3.0f;
     cfg.overcurrentTicks = 25;                // 50 ms at 2 ms per tick
+
+    // Patient-driven modes (Assistive / Resistive / Calibrate). Starting values;
+    // tune on the bench with no one attached first.
+    cfg.trackKpNmPerRad = 60.0f;              // 1 deg behind the reference -> ~1 N*m
+    cfg.trackKiNmPerRadS = 150.0f;
+    cfg.trackKdNmSPerRad = 2.0f;
+    cfg.trackLeashRad = 3.0f * RAD_PER_DEG;
+    cfg.refAccelRadPerSec2 = 60.0f * RAD_PER_DEG;
+    cfg.approachGainPerSec = 2.0f;            // slows to 20 deg/s at 10 deg from the target
+    cfg.effortFilterHz = 3.0f;
+    cfg.effortDeadbandNm = 0.5f;
+    cfg.creepMinRadPerSec = 1.0f * RAD_PER_DEG;   // no effort at 10 % assistance
+    cfg.creepMaxRadPerSec = 5.0f * RAD_PER_DEG;   // no effort at 90 % assistance
+    cfg.virtualDampingNmSPerRad = 28.6f;      // 5 N*m of help at 50 % -> +20 deg/s
+    cfg.maxAssistSpeedRadPerSec = 45.0f * RAD_PER_DEG;
+    cfg.resistAbortNm = 2.0f;
+    cfg.resistAbortSec = 0.3f;
+    cfg.resistSpeedRadPerSec = 10.0f * RAD_PER_DEG;
+    cfg.resistMaxTorqueNm = 10.0f;            // level 9 -> up to 9 N*m against the patient
+    cfg.calSlowRadPerSec = 5.0f * RAD_PER_DEG;
+    cfg.calFastRadPerSec = 20.0f * RAD_PER_DEG;
     return cfg;
+}
+
+NeuroExoControl::AssistMode effortModeFor(NeuroExoProtocol::Mode mode) {
+    switch (mode) {
+        case NeuroExoProtocol::Mode::Assistive: return NeuroExoControl::AssistMode::PatientAssist;
+        case NeuroExoProtocol::Mode::Resistive: return NeuroExoControl::AssistMode::PatientResist;
+        case NeuroExoProtocol::Mode::Calibrate: return NeuroExoControl::AssistMode::Calibrate;
+        default:                                return NeuroExoControl::AssistMode::Track;
+    }
 }
 
 // Set when the controller or the Neutral tracking check faults. Control
@@ -153,40 +193,49 @@ void motorControlISR();
 void processI2CCommand();
 void updateTelemetryFrame();
 
+void stopMotor() {
+    Vc = 0.0f;
+    commandedCurrentA = 0.0f;
+    motor.disable();
+}
+
 void motorControlISR() {
-    if (!interpInitialized && motorMotionActive) {
-        interpolateBegin = encDeg;
-        interpCounter = 0;
-        setPointInterpolated = interpolateBegin;
-        interpIncrement = (interpolateEnd - interpolateBegin) / (float)interpCycles;
-        interpInitialized = true;
+    const NeuroExoProtocol::Mode mode = lastCommandedMode;
+    const bool timedMove = mode == NeuroExoProtocol::Mode::Neutral;
+
+    if (timedMove && motorMotionActive) {
+        if (!interpInitialized) {
+            interpolateBegin = encDeg;
+            interpCounter = 0;
+            setPointInterpolated = interpolateBegin;
+            interpIncrement = (interpolateEnd - interpolateBegin) / (float)interpCycles;
+            interpInitialized = true;
+        }
+        if (interpCounter < interpCycles) {
+            setPointInterpolated += interpIncrement;
+            interpCounter++;
+        } else {
+            // Trajectory finished: hold the setpoint on the target until the joint arrives.
+            setPointInterpolated = interpolateEnd;
+        }
     }
 
-    if (interpCounter < interpCycles && motorMotionActive) {
-        setPointInterpolated += interpIncrement;
-        interpCounter++;
-    } else if (motorMotionActive) {
-        // Trajectory finished: hold the setpoint on the target until the joint arrives.
-        setPointInterpolated = interpolateEnd;
-    }
-
-    if (motorMotionActive && fabsf(encDeg - interpolateEnd) <= TRIAL_TARGET_TOLERANCE_DEG) {
+    // Neutral must settle within tolerance; patient-driven modes can lurch past
+    // the target, so reaching or passing it counts.
+    const bool atTarget = timedMove ? fabsf(encDeg - interpolateEnd) <= TRIAL_TARGET_TOLERANCE_DEG
+                                    : trialDir * (encDeg - interpolateEnd) >= -TRIAL_TARGET_TOLERANCE_DEG;
+    if (motorMotionActive && mode != NeuroExoProtocol::Mode::Calibrate && atTarget) {
         trialTargetReached = true;
         motorMotionActive = false;
         interpInitialized = false;
     }
 
     if (!motorMotionActive) {
-        Vc = 0.0f;
-        commandedCurrentA = 0.0f;
-        motor.disable();
+        stopMotor();
+        patientEffortNm = 0.0f;
         ControlAlgorithm_Reset();
         return;
     }
-
-    const NeuroExoProtocol::Mode mode = lastCommandedMode;
-    bool trackingFault = mode == NeuroExoProtocol::Mode::Neutral &&
-                         fabsf(setPointInterpolated - encDeg) > NEUTRAL_MAX_TRACKING_ERROR_DEG;
 
     NeuroExoControl::ControlInput in;
     in.angleRad = encDeg * RAD_PER_DEG;
@@ -195,15 +244,33 @@ void motorControlISR() {
     in.velocityRadPerSec = measuredVelocityDegPerSec * RAD_PER_DEG;
     in.measuredCurrentA = measuredMotorCurrentA;
     in.dtSec = CONTROL_DT_S;
-    in.mode = (mode == NeuroExoProtocol::Mode::Resistive) ? NeuroExoControl::AssistMode::Resist
-                                                          : NeuroExoControl::AssistMode::Assist;
-    in.assistance = (mode == NeuroExoProtocol::Mode::Assistive) ? ASSISTIVE_ASSISTANCE : NEUTRAL_ASSISTANCE;
-    in.currentLimitScale = maxEffortScaleForSpeed(lastCommandedSpeed);
+    in.mode = effortModeFor(mode);
     in.atForwardLimit = encDeg >= motorLimit.forwardLimit;
     in.atBackwardLimit = encDeg <= motorLimit.backwardLimit;
 
     NeuroExoControl::ControlOutput out;
-    const float currentA = ControlAlgorithm_Update(in, out);
+    float currentA;
+    bool trackingFault = false;
+    if (timedMove) {
+        trackingFault = fabsf(setPointInterpolated - encDeg) > NEUTRAL_MAX_TRACKING_ERROR_DEG;
+        in.assistance = NEUTRAL_ASSISTANCE;
+        in.currentLimitScale = maxEffortScaleForSpeed(lastCommandedSpeed);
+        currentA = ControlAlgorithm_Update(in, out);
+    } else {
+        in.assistance = effortLevel;
+        in.currentLimitScale = 1.0f;
+        currentA = ControlAlgorithm_UpdateEffort(in, out);
+        setPointInterpolated = out.referenceRad / RAD_PER_DEG;
+        patientEffortNm = out.patientEffortNm;
+        if (out.calibrationDone || out.patientResisting) {
+            calibrationFinishedEvent = out.calibrationDone;
+            trialPatientResisting = out.patientResisting;
+            resistanceAbortEvent = out.patientResisting;
+            stopMotor();
+            motorMotionActive = false;
+            return;
+        }
+    }
     const NeuroExoControl::SafetyState state = ControlAlgorithm_GetSafetyState();
 
     if (trackingFault || state != NeuroExoControl::SafetyState::ACTIVE) {
@@ -211,9 +278,7 @@ void motorControlISR() {
             safetyEstopLatched = true;
             lastEstopReason = ControlAlgorithm_GetEstopReason();
         }
-        Vc = 0.0f;
-        commandedCurrentA = 0.0f;
-        motor.disable();
+        stopMotor();
         motorMotionActive = false;
         interpInitialized = false;
         return;
@@ -304,8 +369,8 @@ void processI2CCommand() {
     Serial.print(packet.targetAngleDeg);
     Serial.print(" deg | Mode: ");
     Serial.print((int)packet.mode);
-    Serial.print(" | Speed: ");
-    Serial.println((int)packet.speed);
+    Serial.print(" | Setting: ");
+    Serial.println((int)packet.setting);
 
     invalidCommand = false;
     if (safetyEstopLatched) {
@@ -317,25 +382,71 @@ void processI2CCommand() {
         return;
     }
 
+    const float startDeg = encDeg;
+    const float targetDeg = (float)packet.targetAngleDeg;
+    const float distanceRad = fabsf(targetDeg - startDeg) * RAD_PER_DEG;
+    const NeuroExoControl::AssistMode effortMode = effortModeFor(packet.mode);
+    const float level = packet.setting / 10.0f;
+    int cycles = interpCycles;
+    unsigned long moveMs = 0;
+
+    if (packet.mode == NeuroExoProtocol::Mode::Neutral) {
+        cycles = interpCyclesForSpeed(static_cast<NeuroExoProtocol::Speed>(packet.setting));
+        moveMs = (unsigned long)(cycles * CONTROL_DT_S * 1000.0f);
+    } else if (packet.mode == NeuroExoProtocol::Mode::Calibrate) {
+        if (distanceRad < CALIBRATION_MIN_RANGE_DEG * RAD_PER_DEG) {
+            Serial.println("[Teensy] Ignored: calibration range under 10 deg");
+            return;
+        }
+        if (targetDeg > motorLimit.forwardLimit || targetDeg < motorLimit.backwardLimit) {
+            Serial.println("[Teensy] Ignored: calibration target outside the joint limits");
+            return;
+        }
+        const NeuroExoControl::ControlConfig &cfg = ControlAlgorithm_GetConfig();
+        const float sweepSec = 2.0f * distanceRad / cfg.calSlowRadPerSec + 2.0f * distanceRad / cfg.calFastRadPerSec;
+        moveMs = (unsigned long)(sweepSec * 1000.0f) + 4 * CALIBRATION_PASS_MARGIN_MS;
+    } else {
+        if (!ControlAlgorithm_BaselineCovers(startDeg * RAD_PER_DEG, targetDeg * RAD_PER_DEG)) {
+            Serial.println("[Teensy] Ignored: no calibration covering this range (run Calibrate first)");
+            return;
+        }
+        moveMs = (unsigned long)(1000.0f * distanceRad / ControlAlgorithm_MinTrialSpeedRadPerSec(effortMode, level));
+    }
+
     noInterrupts();
     lastCommandedMode = packet.mode;
-    lastCommandedSpeed = packet.speed;
-    interpolateEnd = (float)packet.targetAngleDeg;
-    interpCycles = interpCyclesForSpeed(packet.speed);
+    lastCommandedSetting = packet.setting;
+    if (packet.mode == NeuroExoProtocol::Mode::Neutral) {
+        lastCommandedSpeed = static_cast<NeuroExoProtocol::Speed>(packet.setting);
+    }
+    effortLevel = level;
+    trialDir = targetDeg >= startDeg ? 1.0f : -1.0f;
+    interpolateEnd = targetDeg;
+    interpCycles = cycles;
     interpInitialized = false;
     trialTargetReached = false;
     trialTimedOut = false;
+    trialPatientResisting = false;
+    patientEffortNm = 0.0f;
+    if (packet.mode != NeuroExoProtocol::Mode::Neutral) {
+        ControlAlgorithm_BeginEffortTrial(effortMode, startDeg * RAD_PER_DEG, targetDeg * RAD_PER_DEG, level);
+        setPointInterpolated = startDeg;
+    }
     trialStartMs = millis();
-    trialTimeLimitMs = (unsigned long)(interpCycles * CONTROL_DT_S * 1000.0f) + TRIAL_TIMEOUT_MARGIN_MS;
+    trialTimeLimitMs = moveMs + TRIAL_TIMEOUT_MARGIN_MS;
     motorMotionActive = true;
     interrupts();
-    Serial.println("[Teensy] Trial started");
+    Serial.println(packet.mode == NeuroExoProtocol::Mode::Calibrate
+                       ? "[Teensy] Calibration started - keep the arm relaxed"
+                       : "[Teensy] Trial started");
 }
 
 void updateTelemetryFrame() {
     NeuroExoProtocol::TelemetryPacket packet;
     packet.currentAngleDeg = (int16_t)lroundf(encDeg);
     packet.currentMilliAmps = (int16_t)lroundf(measuredMotorCurrentA * 1000.0f);
+    const float effortCentiNm = patientEffortNm * 100.0f;
+    packet.patientEffortCentiNm = (int16_t)lroundf(fmaxf(-32767.0f, fminf(32767.0f, effortCentiNm)));
     packet.status = static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::None);
     if (motorMotionActive) {
         packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::MotionActive);
@@ -345,6 +456,12 @@ void updateTelemetryFrame() {
     }
     if (trialTimedOut) {
         packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::TrialTimeout);
+    }
+    if (ControlAlgorithm_BaselineValid()) {
+        packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::Calibrated);
+    }
+    if (trialPatientResisting) {
+        packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::PatientResisting);
     }
     if (safetyEstopLatched) {
         packet.status |= static_cast<uint8_t>(NeuroExoProtocol::TelemetryStatus::SafetyFault);
@@ -433,6 +550,17 @@ void loop() {
     if (timeLimitHit) {
         Serial.println("[Teensy] Trial aborted - time limit exceeded");
     }
+    if (calibrationFinishedEvent) {
+        calibrationFinishedEvent = false;
+        Serial.println(ControlAlgorithm_BaselineValid()
+                           ? "[Teensy] Calibration complete"
+                           : "[Teensy] Calibration failed - not enough steady motion, run it again");
+        ControlAlgorithm_PrintBaselineSummary();
+    }
+    if (resistanceAbortEvent) {
+        resistanceAbortEvent = false;
+        Serial.println("[Teensy] Trial aborted - patient pushing against the motion");
+    }
 
     encBinary = myAS5045.read();
     encRaw = EncDeg(encBinary);
@@ -479,7 +607,13 @@ void loop() {
         Serial.print(',');
         Serial.print(measuredMotorCurrentA, 4);
         Serial.print(',');
-        Serial.println(currentTime);
+        Serial.print(currentTime);
+        Serial.print(',');
+        Serial.print(patientEffortNm, 2);
+        Serial.print(',');
+        Serial.print((int)lastCommandedMode);
+        Serial.print(',');
+        Serial.println((int)lastCommandedSetting);
     }
 
     if (currentTime - lastDebugTime >= DEBUG_INTERVAL_MS) {
@@ -492,7 +626,9 @@ void loop() {
         Serial.print(measuredMotorCurrentA * 1000.0f, 2);
         Serial.print(" mA | Cmd: ");
         Serial.print(commandedCurrentA * 1000.0f, 2);
-        Serial.print(" mA");
+        Serial.print(" mA | Effort: ");
+        Serial.print(patientEffortNm, 2);
+        Serial.print(" N*m");
         if (safetyEstopLatched) {
             Serial.print(" | E-STOP reason ");
             Serial.print((int)lastEstopReason);

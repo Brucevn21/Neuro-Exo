@@ -69,7 +69,8 @@ def main():
         voltage = 6.0 * current_a
 
         line = (f"JOINT,{pos:.2f},{setpoint:.2f},{target:.2f},{voltage:.2f},"
-                f"{vel:.2f},{int(active)},{accel:.2f},{current_a:.4f},{ms}\r\n")
+                f"{vel:.2f},{int(active)},{accel:.2f},{current_a:.4f},{ms},"
+                f"{(2.0 * current_a) if active else 0.0:.2f},1,5\r\n")
         os.write(master, line.encode())
         if ms % 1000 < 20:
             os.write(master, f"[Teensy Telemetry] Target: {target:.2f} deg\r\n".encode())

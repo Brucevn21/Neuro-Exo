@@ -27,7 +27,7 @@ static uint8_t encodeFrame(uint8_t type, const uint8_t *payload, uint8_t length,
 
 uint8_t encodeControlFrame(const ControlPacket &packet, uint8_t *frame) {
     const uint8_t payload[CONTROL_PAYLOAD_SIZE] = {
-        static_cast<uint8_t>(packet.mode), static_cast<uint8_t>(packet.speed),
+        static_cast<uint8_t>(packet.mode), packet.setting,
         static_cast<uint8_t>(packet.targetAngleDeg >> 8), static_cast<uint8_t>(packet.targetAngleDeg)
     };
     return encodeFrame(MESSAGE_CONTROL, payload, CONTROL_PAYLOAD_SIZE, frame);
@@ -36,7 +36,8 @@ uint8_t encodeControlFrame(const ControlPacket &packet, uint8_t *frame) {
 uint8_t encodeTelemetryFrame(const TelemetryPacket &packet, uint8_t *frame) {
     const uint8_t payload[TELEMETRY_PAYLOAD_SIZE] = {
         static_cast<uint8_t>(packet.currentAngleDeg >> 8), static_cast<uint8_t>(packet.currentAngleDeg),
-        static_cast<uint8_t>(packet.currentMilliAmps >> 8), static_cast<uint8_t>(packet.currentMilliAmps), packet.status
+        static_cast<uint8_t>(packet.currentMilliAmps >> 8), static_cast<uint8_t>(packet.currentMilliAmps), packet.status,
+        static_cast<uint8_t>(packet.patientEffortCentiNm >> 8), static_cast<uint8_t>(packet.patientEffortCentiNm)
     };
     return encodeFrame(MESSAGE_TELEMETRY, payload, TELEMETRY_PAYLOAD_SIZE, frame);
 }
@@ -49,14 +50,24 @@ bool isStopFrame(const Frame &frame) {
     return frame.type == MESSAGE_STOP && frame.length == 0;
 }
 
+static bool settingValidForMode(Mode mode, uint8_t setting) {
+    switch (mode) {
+        case Mode::Neutral:   return setting <= static_cast<uint8_t>(Speed::High);
+        case Mode::Assistive:
+        case Mode::Resistive: return setting >= MIN_LEVEL && setting <= MAX_LEVEL;
+        case Mode::Calibrate: return true;
+    }
+    return false;
+}
+
 bool decodeControlFrame(const Frame &frame, ControlPacket &packet) {
     if (frame.type != MESSAGE_CONTROL || frame.length != CONTROL_PAYLOAD_SIZE ||
-        frame.payload[0] > static_cast<uint8_t>(Mode::Neutral) ||
-        frame.payload[1] > static_cast<uint8_t>(Speed::High)) {
+        frame.payload[0] > static_cast<uint8_t>(Mode::Calibrate) ||
+        !settingValidForMode(static_cast<Mode>(frame.payload[0]), frame.payload[1])) {
         return false;
     }
     packet.mode = static_cast<Mode>(frame.payload[0]);
-    packet.speed = static_cast<Speed>(frame.payload[1]);
+    packet.setting = frame.payload[1];
     packet.targetAngleDeg = static_cast<int16_t>((static_cast<uint16_t>(frame.payload[2]) << 8) | frame.payload[3]);
     return true;
 }
@@ -68,6 +79,7 @@ bool decodeTelemetryFrame(const Frame &frame, TelemetryPacket &packet) {
     packet.currentAngleDeg = static_cast<int16_t>((static_cast<uint16_t>(frame.payload[0]) << 8) | frame.payload[1]);
     packet.currentMilliAmps = static_cast<int16_t>((static_cast<uint16_t>(frame.payload[2]) << 8) | frame.payload[3]);
     packet.status = frame.payload[4];
+    packet.patientEffortCentiNm = static_cast<int16_t>((static_cast<uint16_t>(frame.payload[5]) << 8) | frame.payload[6]);
     return true;
 }
 

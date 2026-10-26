@@ -8,15 +8,22 @@ streamed from `src/main.cpp`.
 `main.cpp` streams a compact CSV line at 50 Hz:
 
 ```
-JOINT,<encoderDeg>,<setpointInterpolatedDeg>,<targetDeg>,<motorVoltage>,<velocityDegPerSec>,<motionActive 0|1>,<accelDegPerSec2>,<currentA>,<millis>
+JOINT,<encoderDeg>,<setpointInterpolatedDeg>,<targetDeg>,<motorVoltage>,<velocityDegPerSec>,<motionActive 0|1>,<accelDegPerSec2>,<currentA>,<millis>,<patientEffortNm>,<mode>,<setting>
 ```
+
+`setpointInterpolatedDeg` is the Neutral timed trajectory, or the moving
+reference the joint is held on in the patient-driven modes. `patientEffortNm`
+is positive when the patient helps toward the target and negative when they
+resist. `mode` is 0 Resistive, 1 Assistive, 2 Neutral, 3 Calibrate; `setting`
+is the Neutral speed (0-2) or the Assistive/Resistive level (1-9).
 
 The Teensy env must be built with `-D USB_MIDI_SERIAL` (see `platformio.ini`)
 so it enumerates as a real serial port (`/dev/ttyACM*` / `COMx`). With plain
 `USB_MIDI`, `Serial` is HID-emulated and pyserial cannot open it.
 
 Older firmware that sends only the first 7 fields still displays, but trial
-logging is disabled.
+logging is disabled. Firmware that sends 10 fields (no effort/mode/setting)
+displays and logs with effort 0.
 
 This is emitted alongside the existing 1 Hz human-readable debug print, so
 both can be read from the same serial connection.
@@ -48,7 +55,8 @@ Optional flags:
 - `--no-log`: disable trial logging.
 
 The window shows the rotating joint link (blue = current angle, red dashed =
-commanded target), plus angle and velocity time-series plots.
+commanded target), a readout (angle, target, current, patient effort, mode and
+level), plus angle, velocity and patient-effort time-series plots.
 
 The arm and plots only update while a trial is running (`motionActive=1`). Each
 new trial clears the plots and starts at t = 0 (device time), and the plots show
@@ -86,7 +94,8 @@ the visualizer exits first. Columns:
 | `acceleration_deg_s2` | deg/s² | `measuredAccelDegPerSec2` |
 | `current_position_deg` | deg | encoder (`encDeg`) |
 | `target_position_deg` | deg | commanded target (`interpolateEnd`) |
-| `setpoint_position_deg` | deg | interpolated setpoint the PID tracks |
+| `setpoint_position_deg` | deg | interpolated setpoint / moving reference the PID tracks |
+| `patient_effort_Nm` | N·m | estimated patient torque toward the target (`patientEffortNm`; - = resisting) |
 
 On Windows, close the CSV in Excel before the next trial completes, because
 Excel locks open files and the rotation will fail. Copy files out of

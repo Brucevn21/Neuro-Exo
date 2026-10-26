@@ -27,6 +27,7 @@ CSV_HEADER = [
     "current_position_deg",
     "target_position_deg",
     "setpoint_position_deg",
+    "patient_effort_Nm",
 ]
 
 
@@ -51,7 +52,8 @@ class TrialCsvLogger:
     def trial_path(self, n):
         return os.path.join(self.log_dir, f"trial_run_{n}.csv")
 
-    def handle_sample(self, device_ms, motion_active, current_a, velocity, accel, position, target, setpoint):
+    def handle_sample(self, device_ms, motion_active, current_a, velocity, accel, position, target, setpoint,
+                      effort=0.0):
         """Feed one parsed JOINT sample. Returns the path of a just-completed trial, else None."""
         completed = None
         if not motion_active:
@@ -74,6 +76,7 @@ class TrialCsvLogger:
             f"{position:.2f}",
             f"{target:.2f}",
             f"{setpoint:.2f}",
+            f"{effort:.2f}",
         ])
         self.rows_in_trial += 1
         return completed

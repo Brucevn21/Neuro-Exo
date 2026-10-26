@@ -2,11 +2,11 @@
 """
 Live serial visualizer for the NeuroExo joint.
 
-Reads the "JOINT,<enc>,<setpoint>,<target>,<Vc>,<vel>,<active>,<acc>,<currentA>,<ms>"
-CSV lines streamed by src/main.cpp (see STREAM_INTERVAL_MS) over a serial port
+Reads the "JOINT,<enc>,<setpoint>,<target>,<Vc>,<vel>,<active>,<acc>,<currentA>,<ms>,
+<effortNm>,<mode>,<setting>" CSV lines streamed by src/main.cpp (see STREAM_INTERVAL_MS) over a serial port
 and renders the joint in one window: a 3D elbow brace (fixed upper arm, motor hub,
 rotating forearm; drag to rotate, scroll to zoom), a 2D arm view, a readout, and
-plots of angle and velocity. The views only update while a trial is running (motionActive=1);
+plots of angle, velocity and patient effort. The views only update while a trial is running (motionActive=1);
 each trial starts a fresh plot at t = 0 and the last trial stays on screen until
 the next one begins. Active trials are logged to CSV (see trial_logger.py).
 
@@ -32,6 +32,8 @@ from trial_logger import TrialCsvLogger
 DEFAULT_MIN_DEG = -150.0
 DEFAULT_MAX_DEG = 80.0
 MIN_PLOT_SECONDS = 5.0  # x-axis span before a trial grows past it
+MODE_NAMES = {0: "Resistive", 1: "Assistive", 2: "Neutral", 3: "Calibrate"}
+SPEED_NAMES = {0: "Slow", 1: "Medium", 2: "High"}
 DEFAULT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry_data")
 ELBOW_AXIS = np.array([0.0, 1.0, 0.0])  # the 3D joint rotates about +y
 UPPER_ARM_DEG = 180.0                   # fixed upper arm, outside the joint's travel
@@ -67,13 +69,17 @@ class JointDataStream:
         self.motion_active = False
         self.accel_deg_s2 = 0.0
         self.current_a = 0.0
+        self.effort_nm = 0.0
+        self.mode = None
+        self.setting = None
         self.last_update = None
 
     def poll(self):
         """Read all available lines, log each one, and return the new samples.
 
-        Each sample is (time_s, encoder_deg, setpoint_deg, velocity_deg_s, motion_active),
-        timed by the device clock when the firmware sends it, else the host clock.
+        Each sample is (time_s, encoder_deg, setpoint_deg, velocity_deg_s, motion_active,
+        effort_nm), timed by the device clock when the firmware sends it, else the
+        host clock. Effort is 0 for firmware that doesn't send it.
         """
         samples = []
         while self.ser.in_waiting:
@@ -81,8 +87,9 @@ class JointDataStream:
             if not raw.startswith("JOINT,"):
                 continue
             fields = raw.split(",")
-            # 7 fields = older firmware without accel/current/timestamp (display only, no logging).
-            if len(fields) not in (7, 10):
+            # 7 fields = older firmware without accel/current/timestamp (display only, no logging);
+            # 10 = without patient effort / mode / setting.
+            if len(fields) not in (7, 10, 13):
                 continue
             try:
                 encoder_deg = float(fields[1])
@@ -91,10 +98,13 @@ class JointDataStream:
                 voltage = float(fields[4])
                 velocity = float(fields[5])
                 motion_active = fields[6] == "1"
-                if len(fields) == 10:
+                if len(fields) >= 10:
                     accel = float(fields[7])
                     current_a = float(fields[8])
                     device_ms = int(fields[9])
+                effort_nm = float(fields[10]) if len(fields) == 13 else 0.0
+                mode = int(fields[11]) if len(fields) == 13 else None
+                setting = int(fields[12]) if len(fields) == 13 else None
             except ValueError:
                 continue
             self.encoder_deg = encoder_deg
@@ -103,6 +113,9 @@ class JointDataStream:
             self.voltage = voltage
             self.velocity_deg_s = velocity
             self.motion_active = motion_active
+            self.effort_nm = effort_nm
+            self.mode = mode
+            self.setting = setting
             self.legacy_stream = len(fields) == 7
             if not self.legacy_stream:
                 self.accel_deg_s2 = accel
@@ -111,7 +124,7 @@ class JointDataStream:
                     self._log_sample(device_ms)
             self.last_update = time.time()
             sample_s = self.last_update if self.legacy_stream else device_ms / 1000.0
-            samples.append((sample_s, encoder_deg, setpoint_deg, velocity, motion_active))
+            samples.append((sample_s, encoder_deg, setpoint_deg, velocity, motion_active, effort_nm))
         return samples
 
     def _log_sample(self, device_ms):
@@ -119,6 +132,7 @@ class JointDataStream:
             completed = self.logger.handle_sample(
                 device_ms, self.motion_active, self.current_a, self.velocity_deg_s,
                 self.accel_deg_s2, self.encoder_deg, self.target_deg, self.setpoint_deg,
+                self.effort_nm,
             )
         except OSError as exc:
             # e.g. trial_run_N.csv held open by Excel on Windows.
@@ -147,6 +161,7 @@ class TrialTracker:
         self.angle_hist = []
         self.setpoint_hist = []
         self.vel_hist = []
+        self.effort_hist = []
         self.running = False
         self.count = 0
         self.start_s = 0.0
@@ -154,6 +169,9 @@ class TrialTracker:
         self.target_deg = 0.0
         self.voltage = 0.0
         self.current_a = 0.0
+        self.effort_nm = 0.0
+        self.mode = None
+        self.setting = None
 
     def poll(self):
         """Read new samples; returns True if the trial display needs redrawing."""
@@ -161,11 +179,14 @@ class TrialTracker:
         for sample in self.stream.poll():
             active = sample[4]
             if active and not self.running:
-                for hist in (self.time_hist, self.angle_hist, self.setpoint_hist, self.vel_hist):
+                for hist in (self.time_hist, self.angle_hist, self.setpoint_hist, self.vel_hist,
+                             self.effort_hist):
                     hist.clear()
                 self.running = True
                 self.start_s = sample[0]
                 self.target_deg = self.stream.target_deg
+                self.mode = self.stream.mode
+                self.setting = self.stream.setting
                 self.count += 1
             if active:
                 self._record(sample)
@@ -177,14 +198,26 @@ class TrialTracker:
         return changed
 
     def _record(self, sample):
-        t_s, encoder_deg, setpoint_deg, velocity, _active = sample
+        t_s, encoder_deg, setpoint_deg, velocity, _active, effort_nm = sample
         self.time_hist.append(t_s - self.start_s)
         self.angle_hist.append(encoder_deg)
         self.setpoint_hist.append(setpoint_deg)
         self.vel_hist.append(velocity)
+        self.effort_hist.append(effort_nm)
         self.arm_deg = encoder_deg
+        self.effort_nm = effort_nm
         self.voltage = self.stream.voltage
         self.current_a = self.stream.current_a
+
+    def mode_text(self):
+        if self.mode is None:
+            return "-"
+        name = MODE_NAMES.get(self.mode, f"mode {self.mode}")
+        if self.mode == 2:
+            return f"{name} {SPEED_NAMES.get(self.setting, self.setting)}"
+        if self.mode in (0, 1):
+            return f"{name} {self.setting * 10}%"
+        return name
 
     def readout_text(self):
         if self.running:
@@ -209,6 +242,8 @@ class TrialTracker:
             f"Target:  {self.target_deg:6.2f} deg\n"
             f"Voltage: {self.voltage:5.2f} V\n"
             f"Current: {self.current_a:6.3f} A\n"
+            f"Effort:  {self.effort_nm:6.2f} N*m\n"
+            f"Mode:    {self.mode_text()}\n"
             f"Status:  {status}\n"
             f"Log:     {log_status}"
         )
@@ -257,14 +292,15 @@ def main():
     length = args.link_length
     origin = np.zeros(3)
 
-    fig = plt.figure(figsize=(15, 7.5))
+    fig = plt.figure(figsize=(15, 8.5))
     fig.suptitle(f"NeuroExo Joint Live Visualizer ({args.port} @ {args.baud})")
-    grid = fig.add_gridspec(2, 3, width_ratios=[1.5, 1, 1.2])
+    grid = fig.add_gridspec(3, 3, width_ratios=[1.5, 1, 1.2])
     ax3d = fig.add_subplot(grid[:, 0], projection="3d")
-    ax_arm = fig.add_subplot(grid[0, 1])
-    ax_text = fig.add_subplot(grid[1, 1])
+    ax_arm = fig.add_subplot(grid[0:2, 1])
+    ax_text = fig.add_subplot(grid[2, 1])
     ax_angle = fig.add_subplot(grid[0, 2])
     ax_vel = fig.add_subplot(grid[1, 2])
+    ax_effort = fig.add_subplot(grid[2, 2])
     ax_text.axis("off")
 
     # --- 3D brace view ---
@@ -344,6 +380,15 @@ def main():
     ax_vel.set_xlim(0, MIN_PLOT_SECONDS)
     (vel_line,) = ax_vel.plot([], [], "g-")
 
+    # --- Patient effort history (Assistive/Resistive; + helping, - resisting) ---
+    ax_effort.set_title("Patient Effort (N*m) vs Trial Time")
+    ax_effort.set_xlabel("Time (s)")
+    ax_effort.set_ylabel("N*m")
+    ax_effort.grid(True, linestyle=":", alpha=0.5)
+    ax_effort.set_xlim(0, MIN_PLOT_SECONDS)
+    ax_effort.axhline(0, color="gray", linewidth=0.8)
+    (effort_line,) = ax_effort.plot([], [], color="tab:purple")
+
     fig.tight_layout()
 
     def update(_frame):
@@ -361,8 +406,12 @@ def main():
             angle_line.set_data(trial.time_hist, trial.angle_hist)
             setpoint_line.set_data(trial.time_hist, trial.setpoint_hist)
             vel_line.set_data(trial.time_hist, trial.vel_hist)
-            for ax in (ax_angle, ax_vel):
+            effort_line.set_data(trial.time_hist, trial.effort_hist)
+            for ax in (ax_angle, ax_vel, ax_effort):
                 ax.set_xlim(0, max(MIN_PLOT_SECONDS, trial.time_hist[-1]))
+            emin, emax = min(trial.effort_hist), max(trial.effort_hist)
+            epad = max(1.0, (emax - emin) * 0.1)
+            ax_effort.set_ylim(min(emin, 0) - epad, max(emax, 0) + epad)
             vmin, vmax = min(trial.vel_hist), max(trial.vel_hist)
             pad = max(5.0, (vmax - vmin) * 0.1)
             ax_vel.set_ylim(vmin - pad, vmax + pad)

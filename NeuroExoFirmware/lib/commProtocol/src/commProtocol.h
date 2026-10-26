@@ -11,7 +11,7 @@ constexpr uint8_t MESSAGE_CONTROL = 0x10;
 constexpr uint8_t MESSAGE_TELEMETRY = 0x11;
 constexpr uint8_t MESSAGE_STOP = 0x12;
 constexpr uint8_t CONTROL_PAYLOAD_SIZE = 4;
-constexpr uint8_t TELEMETRY_PAYLOAD_SIZE = 5;
+constexpr uint8_t TELEMETRY_PAYLOAD_SIZE = 7;
 constexpr uint8_t FRAME_OVERHEAD = 5;
 constexpr uint8_t MAX_PAYLOAD_SIZE = TELEMETRY_PAYLOAD_SIZE;
 constexpr uint8_t MAX_FRAME_SIZE = FRAME_OVERHEAD + MAX_PAYLOAD_SIZE;
@@ -24,14 +24,17 @@ enum class TelemetryStatus : uint8_t {
     CommandTimeout = 1 << 1,
     InvalidCommand = 1 << 2,
     SafetyFault = 1 << 3,
-    TargetReached = 1 << 4,  // Last trial ended at its target
-    TrialTimeout = 1 << 5    // Last trial was aborted by the trial time limit
+    TargetReached = 1 << 4,    // Last trial ended at its target
+    TrialTimeout = 1 << 5,     // Last trial was aborted by the trial time limit
+    Calibrated = 1 << 6,       // A baseline calibration is stored (Assistive/Resistive allowed)
+    PatientResisting = 1 << 7  // Last Assistive trial was aborted: patient pushed against it
 };
 
 enum class Mode : uint8_t {
-    Resistive = 0,
-    Assistive = 1,
-    Neutral = 2
+    Resistive = 0,  // Robot moves toward the target while the patient pushes against it
+    Assistive = 1,  // Patient-driven: robot speed follows the patient's effort
+    Neutral = 2,    // Robot-driven timed move (passive range of motion)
+    Calibrate = 3   // Relaxed baseline sweep to the target and back
 };
 
 enum class Speed : uint8_t {
@@ -40,9 +43,14 @@ enum class Speed : uint8_t {
     High = 2
 };
 
+// Assistive/Resistive level: 1..9 = 10%..90%.
+constexpr uint8_t MIN_LEVEL = 1;
+constexpr uint8_t MAX_LEVEL = 9;
+
 struct __attribute__((packed)) ControlPacket {
     Mode mode = Mode::Neutral;
-    Speed speed = Speed::Medium;
+    // Neutral: Speed (0..2). Assistive/Resistive: level (1..9). Calibrate: unused (0).
+    uint8_t setting = static_cast<uint8_t>(Speed::Medium);
     int16_t targetAngleDeg = 0;
 };
 
@@ -50,6 +58,8 @@ struct __attribute__((packed)) TelemetryPacket {
     int16_t currentAngleDeg = 0;
     int16_t currentMilliAmps = 0;
     uint8_t status = 0;
+    // Estimated patient torque toward the target, 0.01 N*m units; negative = resisting.
+    int16_t patientEffortCentiNm = 0;
 };
 
 struct Frame {

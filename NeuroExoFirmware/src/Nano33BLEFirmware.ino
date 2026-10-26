@@ -87,6 +87,7 @@ const char *modeName(Mode mode) {
     case Mode::Resistive: return "Resistive";
     case Mode::Assistive: return "Assistive";
     case Mode::Neutral: return "Neutral";
+    case Mode::Calibrate: return "Calibrate";
     default: return "Unknown";
   }
 }
@@ -119,8 +120,16 @@ void printReceivedCommand(const uint8_t *frame, uint8_t length, const ControlPac
   Serial.println(" deg");
   Serial.print("Mode: ");
   Serial.println(modeName(command.mode));
-  Serial.print("Speed: ");
-  Serial.println(speedName(command.speed));
+  if (command.mode == Mode::Neutral) {
+    Serial.print("Speed: ");
+    Serial.println(speedName(static_cast<Speed>(command.setting)));
+  } else if (command.mode != Mode::Calibrate) {
+    Serial.print("Level: ");
+    Serial.print(command.setting);
+    Serial.print(" (");
+    Serial.print(command.setting * 10);
+    Serial.println("% assistance)");
+  }
 }
 
 #if BLE_PACKET_TEST
