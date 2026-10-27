@@ -131,15 +131,33 @@ volatile float measuredVelocityDegPerSec = 0.0f;
 volatile float measuredAccelDegPerSec2 = 0.0f;
 volatile float measuredMotorCurrentA = 0.0f;
 
-float lastEncDegForDeriv = 0.0f;
 float lastVelDegPerSec = 0.0f;
 unsigned long lastKinematicMicros = 0;
-// Differentiate at a fixed rate (not every loop pass) so one encoder count
-// (~0.088 deg) doesn't become a huge velocity spike, then low-pass with an
-// EMA. At 2 ms: alpha 0.2 ~ 20 Hz cutoff, alpha 0.1 ~ 9 Hz cutoff.
+// Joint velocity is the encoder's travel over a 50 ms rolling window (the mean
+// of the 2 ms samples in it), so one encoder count (~0.088 deg) is 1.8 deg/s,
+// not a 44 deg/s spike. Acceleration is its derivative, low-pass filtered
+// (alpha 0.1 ~ 9 Hz cutoff at 2 ms).
 const unsigned long KINEMATIC_SAMPLE_US = 2000;
-const float VELOCITY_FILTER_ALPHA = 0.2f;
+const uint8_t VELOCITY_WINDOW_SAMPLES = 25;    // x 2 ms = 50 ms
 const float ACCEL_FILTER_ALPHA = 0.1f;
+float encWindowDeg[VELOCITY_WINDOW_SAMPLES] = {};
+unsigned long encWindowMicros[VELOCITY_WINDOW_SAMPLES] = {};
+uint8_t encWindowIndex = 0;
+uint8_t encWindowFill = 0;
+// Backup: the ESCON's speed output (analog out on pin 20), averaged over every
+// loop pass in each 2 ms sample. Used while the encoder isn't trustworthy: not
+// yet seeded, or a read rejected within the last window. It is biased by up to
+// ~6 deg/s and reads ~0 at +3 deg/s (no speed sensor on the ESCON?), so it is
+// only a fallback. Bench fit against encoder slope at +/-3, 7, 15 deg/s (10-bit
+// ADC counts): zero = idle reading, slope = linear fit; positive motion lowers it.
+const bool VELOCITY_FROM_ESCON_ALWAYS = false;  // TEMP comparison: ESCON speed as the primary source
+const float VELOCITY_SENSOR_ZERO_COUNTS = 600.0f;
+const float VELOCITY_SENSOR_COUNTS_PER_DEG_S = -1.3585f;
+uint32_t velocityCountsSum = 0;
+uint32_t velocityCountsN = 0;
+volatile float escVelocityDegPerSec = 0.0f;
+bool velocityFromEscon = true;
+unsigned long lastEncRejectMicros = 0;
 unsigned long lastStreamTime = 0;
 const unsigned long STREAM_INTERVAL_MS = 20; // 50 Hz feed for the live visualizer
 const bool STREAM_JOINT_CSV = true;           // true to feed the live visualizer
@@ -162,9 +180,9 @@ const float NEUTRAL_MAX_TRACKING_ERROR_DEG = 10.0f;  // Neutral only
 NeuroExoControl::ControlConfig makeControlConfig() {
     NeuroExoControl::ControlConfig cfg;
     cfg.esconFullScaleCurrentA = ESCON_FULL_SCALE_CURRENT_A;
-    cfg.kpNmPerRad = 250.0f;
-    cfg.kdNmSPerRad = 8.0f;
-    cfg.frictionCompNm = 6.3f;                // ~1.15 A: keeps the joint sliding once it moves
+    cfg.kpNmPerRad = 600.0f;
+    cfg.kdNmSPerRad = 12.0f;
+    cfg.frictionCompNm = 3.0f;                // ~0.55 A: keeps the joint sliding once it moves (bench-tuned, no limb)
     cfg.frictionRampRad = 1.0f * RAD_PER_DEG;
     cfg.frictionStaticNm = 9.3f;              // ~1.7 A: breaks it free from rest
     cfg.frictionStribeckRadPerSec = 1.5f * RAD_PER_DEG;
@@ -570,7 +588,6 @@ void setup() {
     ControlAlgorithm_SetConfig(makeControlConfig());
 
     lastKinematicMicros = micros();
-    lastEncDegForDeriv = encDeg;
     lastVelDegPerSec = 0.0f;
 
     motorControlTimer.begin(motorControlISR, 2000);
@@ -640,6 +657,7 @@ void loop() {
         encConsecutiveRejects = 0;
     } else {
         encRejectedReads++;
+        lastEncRejectMicros = micros();
         if (++encConsecutiveRejects >= ENCODER_MAX_CONSECUTIVE_REJECTS) {
             noInterrupts();
             if (motorMotionActive) {
@@ -651,18 +669,37 @@ void loop() {
             interrupts();
             if (encReadValid) {
                 encDeg = encReadDeg;
-                lastEncDegForDeriv = encReadDeg;  // no velocity spike from the re-seed
             }
+            encWindowFill = 0;  // don't differentiate across the re-seed jump
             encConsecutiveRejects = 0;
             Serial.println("[Teensy] Encoder re-seeded after repeated jumps (E-stop if a trial was running)");
         }
     }
 
+    velocityCountsSum += analogRead(ESCON_AN2);
+    velocityCountsN++;
     unsigned long nowMicros = micros();
     if (nowMicros - lastKinematicMicros >= KINEMATIC_SAMPLE_US) {
         float dtSec = (nowMicros - lastKinematicMicros) * 1.0e-6f;
-        float rawVel = (encDeg - lastEncDegForDeriv) / dtSec;
-        float vel = VELOCITY_FILTER_ALPHA * rawVel + (1.0f - VELOCITY_FILTER_ALPHA) * lastVelDegPerSec;
+        const float counts = (float)velocityCountsSum / velocityCountsN;
+        escVelocityDegPerSec = (counts - VELOCITY_SENSOR_ZERO_COUNTS) / VELOCITY_SENSOR_COUNTS_PER_DEG_S;
+
+        // Window of the last 50 ms of encoder samples; the oldest is overwritten next.
+        const uint8_t oldest = encWindowFill < VELOCITY_WINDOW_SAMPLES ? 0 : encWindowIndex;
+        const float oldestDeg = encWindowDeg[oldest];
+        const unsigned long oldestMicros = encWindowMicros[oldest];
+        const bool windowEmpty = encWindowFill == 0;
+        encWindowDeg[encWindowIndex] = encDeg;
+        encWindowMicros[encWindowIndex] = nowMicros;
+        encWindowIndex = (encWindowIndex + 1) % VELOCITY_WINDOW_SAMPLES;
+        if (encWindowFill < VELOCITY_WINDOW_SAMPLES) {
+            encWindowFill++;
+        }
+        velocityFromEscon = VELOCITY_FROM_ESCON_ALWAYS || !encSeeded || windowEmpty ||
+                            nowMicros - lastEncRejectMicros < VELOCITY_WINDOW_SAMPLES * KINEMATIC_SAMPLE_US;
+        float vel = velocityFromEscon
+                        ? escVelocityDegPerSec
+                        : (encDeg - oldestDeg) / ((nowMicros - oldestMicros) * 1.0e-6f);
         float rawAcc = (vel - lastVelDegPerSec) / dtSec;
         float acc = ACCEL_FILTER_ALPHA * rawAcc + (1.0f - ACCEL_FILTER_ALPHA) * measuredAccelDegPerSec2;
 
@@ -670,8 +707,9 @@ void loop() {
         measuredAccelDegPerSec2 = acc;
 
         lastVelDegPerSec = vel;
-        lastEncDegForDeriv = encDeg;
         lastKinematicMicros = nowMicros;
+        velocityCountsSum = 0;
+        velocityCountsN = 0;
     }
 
     int adcCurrent = analogRead(ESCON_AN1);
@@ -720,7 +758,12 @@ void loop() {
         Serial.print(commandedCurrentA * 1000.0f, 2);
         Serial.print(" mA | Effort: ");
         Serial.print(patientEffortNm, 2);
-        Serial.print(" N*m | Enc rejects: ");
+        Serial.print(" N*m | Vel: ");
+        Serial.print(measuredVelocityDegPerSec, 2);
+        Serial.print(velocityFromEscon ? " deg/s (ESCON backup)" : " deg/s (encoder)");
+        Serial.print(", ESCON ");
+        Serial.print(escVelocityDegPerSec, 2);
+        Serial.print(" | Enc rejects: ");
         Serial.print(encRejectedReads);
         Serial.print(" (parity/status: ");
         Serial.print(encInvalidReads);

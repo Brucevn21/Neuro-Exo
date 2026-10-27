@@ -21,7 +21,7 @@
 
 // ESCON Feedback.
 #define ESCON_AN1 21		// Current - Configured Analog feedback from ESCON
-#define ESCON_AN2 20		// Velocity
+#define ESCON_AN2 20		// Velocity - ESCON speed analog output (backup joint velocity)
 
 // led pin
 #define LED 13				// Onboard LED teensey 

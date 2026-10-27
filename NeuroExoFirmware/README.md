@@ -67,6 +67,18 @@ Demo sweeps the arm 0° → 70° → 0° with **no one attached** (moving to 0°
 | Medium (7 °/s) | `02 10 04 02 01 00 3C E2 03` | `02 10 04 02 01 00 00 56 03` | `02 10 04 02 01 FF D8 87 03` |
 | High (15 °/s) | `02 10 04 02 02 00 3C 5F 03` | `02 10 04 02 02 00 00 EB 03` | `02 10 04 02 02 FF D8 3A 03` |
 
+## Desktop and mobile arm-control app
+
+The [Arm Control app](tools/arm_app/README.md) provides a Windows Python desktop
+interface and a phone-friendly web interface over local Wi-Fi. It includes a
+rotatable 3D arm, a 10–90% assistance/resistance slider, target and speed controls,
+Start / End / Stop / Demo / Home / Calibrate commands, and trial CSV export.
+Both interfaces share the computer's BLE connection to the Nano 33 BLE. A
+simulated device supports testing without hardware.
+
+On Windows, double-click `tools/arm_app/run_windows.bat`; see its README for
+setup, phone access, and data-channel limitations.
+
 ## Serial debug output
 
 The Teensy prints on its USB serial port at 115200 baud:

@@ -1,0 +1,2 @@
+# Only needed for real Bluetooth. The simulator and both UIs use the stdlib.
+bleak>=1.0,<4

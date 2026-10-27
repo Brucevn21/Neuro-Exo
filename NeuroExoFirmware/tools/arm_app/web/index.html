@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0b1523">
+  <title>NeuroExo · Arm Control</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><h1>NeuroExo<span>ARM CONTROL</span></h1><p>Movement, measured.</p></div><span id="badge" class="badge">OFFLINE</span></header>
+    <section class="connection" aria-label="Device connection">
+      <label>Device<select id="source"><option value="simulation">Simulated arm</option><option value="bluetooth">Nano 33 BLE</option></select></label>
+      <label class="address">BLE address <span>optional</span><input id="identifier" placeholder="Auto-discover Nano33BLE_Master" autocomplete="off"></label>
+      <button id="connect">Connect</button>
+    </section>
+    <div class="layout">
+      <section class="visuals" aria-label="Live arm visualization">
+        <div class="scene card"><div class="scene-label"><span>LIVE ARM</span><span id="motion">Waiting for connection</span></div><canvas id="arm" aria-label="3D elbow visualization: drag to rotate, scroll to zoom"></canvas><div class="scene-footer"><span><i></i> Current arm <b>┄</b> Requested target</span><button id="reset" class="quiet">Reset view</button></div></div>
+        <div class="metrics"><div><span>JOINT ANGLE</span><strong id="angle">—</strong></div><div><span>MOTOR CURRENT</span><strong id="current">—</strong></div><div><span>PATIENT EFFORT</span><strong id="effort">—</strong></div></div>
+        <div class="card chart"><div class="section-label">ANGLE HISTORY <span>Last 1,500 samples · full data in CSV</span></div><canvas id="chart" aria-label="Trial angle plotted over time"></canvas></div>
+      </section>
+      <section class="controls card" aria-label="Trial controls">
+        <div class="section-label">SESSION CONTROL<span id="calibration">Not calibrated</span></div>
+        <h2>Set the next movement</h2>
+        <label>Mode<select id="mode"><option value="assistive">Assistive</option><option value="resistive">Resistive</option><option value="neutral">Neutral</option></select></label>
+        <label>Target angle <span>−150° to 80°</span><div class="unit-input"><input id="target" type="number" min="-150" max="80" step="1" value="60"><span>degrees</span></div></label>
+        <div class="level-title"><label id="level-label" for="level">Assistance</label><strong id="level-value">50%</strong></div>
+        <input id="level" type="range" min="1" max="9" step="1" value="5"><div class="range-labels"><span>10%</span><span>90%</span></div>
+        <p class="hint">Applied when the next trial starts.</p>
+        <label>Speed <span>Neutral · Demo · Home</span><select id="speed"><option value="0">Slow · 3°/s</option><option value="1">Medium · 7°/s</option><option value="2">High · 15°/s</option></select></label>
+        <div class="trial-buttons"><button id="start" class="primary" disabled>Start trial <span>↗</span></button><button id="end" disabled>End trial &amp; save</button></div>
+        <div class="two-buttons"><button id="demo" disabled>Demo sweep</button><button id="home" disabled>Home · 0°</button></div>
+        <button id="calibrate" class="quiet full" disabled>Calibrate to target</button>
+        <p class="hint">Calibrate the intended range before Assistive / Resistive. Demo sweeps 0° → 70° → 0° with no one attached.</p>
+        <button id="stop" class="stop" disabled>■ &nbsp; STOP</button>
+      </section>
+    </div>
+    <div id="message" role="status" aria-live="polite">Open the complete phone link printed by the Python app.</div>
+    <section class="trials card"><div class="trial-heading"><div><div class="section-label">TRIAL LIBRARY</div><h2>Your recorded movements</h2></div><span>Saved on the Python computer</span></div><div id="trials"><p class="empty">Completed and interrupted trials will appear here.</p></div></section>
+    <footer>NeuroExo · Local session <span>Phone controls share the computer’s Bluetooth connection.</span></footer>
+  </main>
+</body>
+</html>
