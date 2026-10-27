@@ -67,6 +67,18 @@ Demo sweeps the arm 0° → 70° → 0° with **no one attached** (moving to 0°
 | Medium (7 °/s) | `02 10 04 02 01 00 3C E2 03` | `02 10 04 02 01 00 00 56 03` | `02 10 04 02 01 FF D8 87 03` |
 | High (15 °/s) | `02 10 04 02 02 00 3C 5F 03` | `02 10 04 02 02 00 00 EB 03` | `02 10 04 02 02 FF D8 3A 03` |
 
+## Serial debug output
+
+The Teensy prints on its USB serial port at 115200 baud:
+
+- Event lines such as `[Teensy] Trial started`, `[Teensy] Stop received - trial ended` and `[Teensy] Ignored: ...`.
+- `JOINT,...` CSV lines at 50 Hz for the [live visualizer](tools/visualizer/README.md).
+- A `[Teensy Telemetry]` line once per second: target, angle, measured and commanded current, patient effort, `Enc rejects: N (parity/status: M)` (encoder readings rejected in the last second), and the E-stop reason when one is latched (0 tracking, 1 invalid input, 2 overspeed, 3 overcurrent).
+
+## Temporary bench-testing changes
+
+The overcurrent trip is disabled and the debug line has an extra `TEMP enc raw ... status 0b...` encoder print. Both must be reverted before the device is used on a person. See [Temporary Bench-Testing Changes](../README.md#temporary-bench-testing-changes) in the repository README for why, the risks, and how to restore them.
+
 ## Wiring
 
 Pin assignments and board-to-board connections for the Teensy 4.1 and Nano 33 BLE are in the [connection map](lib/pinMap/README.md).

@@ -90,7 +90,7 @@ the visualizer exits first. Columns:
 | column | units | source |
 |---|---|---|
 | `elapsed_ms` | ms since trial start | Teensy `millis()` |
-| `current_A` | A | ESCON AN1 (`measuredMotorCurrentA`) |
+| `current_A` | A | ESCON AN1 (`measuredMotorCurrentA`). Not meaningful while AN1 is unconnected (reads about 1.5 A); see [Temporary Bench-Testing Changes](../../../README.md#temporary-bench-testing-changes) |
 | `velocity_deg_s` | deg/s | `measuredVelocityDegPerSec` |
 | `acceleration_deg_s2` | deg/s² | `measuredAccelDegPerSec2` |
 | `current_position_deg` | deg | encoder (`encDeg`) |

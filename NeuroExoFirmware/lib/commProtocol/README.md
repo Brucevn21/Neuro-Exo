@@ -84,7 +84,7 @@ Payload fields:
 | Byte | Field | Description |
 | ---: | --- | --- |
 | 3-4 | `currentAngleDeg` | Signed `int16_t`, big-endian, degrees |
-| 5-6 | `currentMilliAmps` | Signed `int16_t`, big-endian, milliamps |
+| 5-6 | `currentMilliAmps` | Signed `int16_t`, big-endian, milliamps. Not meaningful while the ESCON current-feedback pin is unconnected (reads about 1500) |
 | 7 | `status` | Status bit field |
 | 8-9 | `patientEffortCentiNm` | Signed `int16_t`, big-endian, 0.01 N·m: estimated patient torque toward the target (negative = resisting). 0 outside Assistive / Resistive trials |
 
@@ -95,7 +95,7 @@ Status bits:
 | 0 | `MotionActive` | A trial is currently running |
 | 1 | `CommandTimeout` | Unused in trial mode (reserved) |
 | 2 | `InvalidCommand` | The most recent received I2C command was invalid |
-| 3 | `SafetyFault` | Controller e-stop latched (over-speed, overcurrent, invalid sensor data, or tracking error). Control frames are ignored until a stop frame clears it |
+| 3 | `SafetyFault` | Controller e-stop latched (over-speed, overcurrent, invalid sensor data, or tracking error). Control frames are ignored until a stop frame clears it. The overcurrent check is temporarily disabled; see [Temporary Bench-Testing Changes](../../../README.md#temporary-bench-testing-changes) |
 | 4 | `TargetReached` | The last trial ended with the joint at its target (within 1 deg for Neutral / Demo / Home, 2 deg otherwise) |
 | 5 | `TrialTimeout` | The last trial was aborted by the trial time limit |
 | 6 | `Calibrated` | A baseline calibration is stored, so Assistive / Resistive trials can run within its range |

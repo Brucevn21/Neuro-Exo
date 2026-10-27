@@ -87,8 +87,8 @@ Built from the `teensy41` environment ([`main.cpp`](../../src/main.cpp) + [`Cont
 | 13 | `LED` | Out | Onboard LED | Set HIGH at boot as a power/alive indicator. |
 | 18 | `Wire` SDA | I/O | Nano 33 BLE A4 (SDA) | I2C slave at address `0x08`. |
 | 19 | `Wire` SCL | In | Nano 33 BLE A5 (SCL) | I2C clock from the Nano. |
-| 21 (A7) | `ESCON_AN1` | Analog in | ESCON analog output 1 (current) | Read every loop, 10-bit, 3.3 V reference. Reported in telemetry as mA. |
-| USB | `Serial` | — | PC | 115200 baud. Debug text plus `JOINT,...` CSV lines for [the visualizer](../../tools/visualizer/README.md). |
+| 21 (A7) | `ESCON_AN1` | Analog in | ESCON analog output 1 (current) | Read every loop, 10-bit, 3.3 V reference. Reported in telemetry as mA. **Currently not connected**: the floating pin reads about 1.5 A, so the overcurrent trip is temporarily disabled ([details](../../../README.md#temporary-bench-testing-changes)). |
+| USB | `Serial` | — | PC | 115200 baud. Debug text plus `JOINT,...` CSV lines for [the visualizer](../../tools/visualizer/README.md). The debug line format is in the [firmware README](../../README.md#serial-debug-output). |
 
 ### Defined but not used by current firmware
 
