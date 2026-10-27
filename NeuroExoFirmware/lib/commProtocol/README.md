@@ -35,9 +35,9 @@ Payload fields:
 
 | Byte | Field | Values |
 | ---: | --- | --- |
-| 3 | `MODE` | `0` Resistive, `1` Assistive, `2` Neutral, `3` Calibrate |
-| 4 | `SETTING` | Neutral: speed `0` Slow, `1` Medium, `2` High. Assistive / Resistive: level `1`-`9` = 10 %-90 %. Calibrate: ignored (send `0`) |
-| 5-6 | `targetAngleDeg` | Signed `int16_t`, big-endian, degrees. Calibrate: the far end of the sweep |
+| 3 | `MODE` | `0` Resistive, `1` Assistive, `2` Neutral, `3` Calibrate, `4` Demo, `5` Home |
+| 4 | `SETTING` | Neutral / Demo / Home: speed `0` Slow, `1` Medium, `2` High. Assistive / Resistive: level `1`-`9` = 10 %-90 %. Calibrate: ignored (send `0`) |
+| 5-6 | `targetAngleDeg` | Signed `int16_t`, big-endian, degrees. Calibrate: the far end of the sweep. Demo / Home: ignored (send `0`) |
 
 A frame whose `SETTING` is out of range for its mode (e.g. Assistive with `0`) is invalid and discarded.
 
@@ -51,6 +51,12 @@ The CRC in this example covers:
 
 ```text
 10 04 01 05 FF 85
+```
+
+Example: Home at Medium speed:
+
+```text
+02 10 04 05 01 00 00 34 03
 ```
 
 ## Stop frame: 5 bytes
@@ -90,7 +96,7 @@ Status bits:
 | 1 | `CommandTimeout` | Unused in trial mode (reserved) |
 | 2 | `InvalidCommand` | The most recent received I2C command was invalid |
 | 3 | `SafetyFault` | Controller e-stop latched (over-speed, overcurrent, invalid sensor data, or tracking error). Control frames are ignored until a stop frame clears it |
-| 4 | `TargetReached` | The last trial ended with the joint within 2 deg of its target |
+| 4 | `TargetReached` | The last trial ended with the joint at its target (within 1 deg for Neutral / Demo / Home, 2 deg otherwise) |
 | 5 | `TrialTimeout` | The last trial was aborted by the trial time limit |
 | 6 | `Calibrated` | A baseline calibration is stored, so Assistive / Resistive trials can run within its range |
 | 7 | `PatientResisting` | The last Assistive trial was aborted because the patient pushed against the motion |
@@ -113,20 +119,22 @@ A valid control frame starts a trial when no trial is running. What the robot do
 
 | Mode | What happens |
 | --- | --- |
-| Neutral | Robot-driven timed move from the current angle to the target (Slow 20 s, Medium 12 s, High 6 s), then holds the target. The patient can stay passive. |
+| Neutral | Robot-driven move from the current angle to the target at a constant speed (Slow 3 °/s, Medium 7 °/s, High 15 °/s), so the move time depends on the distance. The patient can stay passive. |
 | Assistive | Patient-driven. The robot creeps toward the target (1 °/s at level 1 up to 5 °/s at level 9) and speeds up as it detects the patient helping: speed = creep + effort / ((1 - level) x 28.6 N·m·s/rad), up to 45 °/s, slowing near the target. The same push moves the arm faster at higher levels. |
 | Resistive | The robot moves toward the target at 10 °/s while the patient pushes against it. It pushes at most level x 10 N·m beyond what the relaxed arm needs (level 3 = 3 N·m); resisting harder than that stalls the arm. |
+| Demo | For showing the device with no one attached. A robot-driven sweep 0° → 70° → 0° at the Neutral speed for the setting. If the joint is not already within 1° of 0° it first moves to 0° the same way. Ends back at 0°. No calibration needed. |
+| Home | Robot-driven move from the current angle to 0° at the Neutral speed for the setting. No calibration needed. |
 | Calibrate | With the patient relaxed, the robot moves from the current angle to the target and back twice (5 °/s, then 20 °/s), recording the torque the relaxed arm needs at each angle. Run once per session; Assistive and Resistive trials are refused until a calibration covers their range. |
 
 The joint isn't back-drivable, so the robot always does the moving and reads the patient's effort as the calibrated relaxed-arm torque minus the torque it is commanding. A Teensy reset loses the calibration, and calibration is rejected (status bit `Calibrated` stays clear) if the arm doesn't move steadily enough to measure.
 
 A trial ends when the first of these happens:
 
-- the joint is within 2 deg of the target, or past it in Assistive / Resistive (`TargetReached` is set),
+- the joint is within 1 deg of the target in Neutral / Demo / Home, or within 2 deg of or past it in Assistive / Resistive (`TargetReached` is set). In Demo this applies to the last waypoint; reaching an earlier one starts the next leg,
 - a stop frame arrives,
 - a safety fault trips (`SafetyFault` is set),
 - in Assistive, the patient pushes against the motion by more than 2 N·m for 0.3 s (`PatientResisting` is set),
-- the time limit expires (`TrialTimeout` is set): the move time at the slowest speed the mode can run (Neutral duration, Assistive creep, Resistive speed, or the calibration sweep) + 5 s,
+- the time limit expires (`TrialTimeout` is set): the move time at the slowest speed the mode can run (Neutral / Home / Demo travel distance at the Neutral speed, Assistive creep, Resistive speed, or the calibration sweep) + 5 s,
 - Calibrate: the sweep finishes.
 
 Other rules:

@@ -80,6 +80,7 @@ class AS5045
   unsigned int read_bias () ;
   byte status () ;
   boolean valid () ;
+  boolean parityOk () ;  // latest read passed the even-parity check
   int Zaxis () ;
   
 

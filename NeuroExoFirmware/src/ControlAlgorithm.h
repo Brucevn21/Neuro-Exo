@@ -54,6 +54,16 @@ struct ControlConfig {
     float kpNmPerRad = 0.0f;
     float kdNmSPerRad = 0.0f;
 
+    // Track only: Coulomb friction feedforward along the setpoint's motion; once
+    // the setpoint stops, ramped in over frictionRampRad of tracking error so it
+    // doesn't chatter at rest.
+    float frictionCompNm = 0.0f;             // sliding friction
+    float frictionRampRad = 0.0f;
+    // Extra breakaway torque up to frictionStaticNm while the joint is still,
+    // fading out by about frictionStribeckRadPerSec of joint speed.
+    float frictionStaticNm = 0.0f;
+    float frictionStribeckRadPerSec = 0.0f;
+
     // Gravity compensation; leave mass at 0 to disable.
     float massKg = 0.0f;
     float centerOfMassM = 0.0f;

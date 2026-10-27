@@ -14,8 +14,9 @@ JOINT,<encoderDeg>,<setpointInterpolatedDeg>,<targetDeg>,<motorVoltage>,<velocit
 `setpointInterpolatedDeg` is the Neutral timed trajectory, or the moving
 reference the joint is held on in the patient-driven modes. `patientEffortNm`
 is positive when the patient helps toward the target and negative when they
-resist. `mode` is 0 Resistive, 1 Assistive, 2 Neutral, 3 Calibrate; `setting`
-is the Neutral speed (0-2) or the Assistive/Resistive level (1-9).
+resist. `mode` is 0 Resistive, 1 Assistive, 2 Neutral, 3 Calibrate, 4 Demo, 5 Home;
+`setting` is the Neutral/Demo/Home speed (0-2) or the Assistive/Resistive level
+(1-9). During a Demo, `targetDeg` changes to each waypoint in turn.
 
 The Teensy env must be built with `-D USB_MIDI_SERIAL` (see `platformio.ini`)
 so it enumerates as a real serial port (`/dev/ttyACM*` / `COMx`). With plain

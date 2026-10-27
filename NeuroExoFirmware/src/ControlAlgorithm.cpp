@@ -98,6 +98,10 @@ static inline bool configReady(const ControlConfig &cfg) {
            cfg.kdNmSPerRad >= 0.0f &&
            cfg.massKg >= 0.0f &&
            cfg.centerOfMassM >= 0.0f &&
+           cfg.frictionCompNm >= 0.0f &&
+           cfg.frictionRampRad > 0.0f &&
+           cfg.frictionStaticNm >= cfg.frictionCompNm &&
+           cfg.frictionStribeckRadPerSec > 0.0f &&
            cfg.softVelocityLimitRadPerSec > 0.0f &&
            cfg.overspeedDampingNmSPerRad >= 0.0f &&
            cfg.hardVelocityLimitRadPerSec > cfg.softVelocityLimitRadPerSec &&
@@ -182,8 +186,23 @@ public:
         const float setpointVel = (in.setpointRad - lastSetpointRad_) / in.dtSec;
         lastSetpointRad_ = in.setpointRad;
 
-        float trackingNm = assistance * (cfg_.kpNmPerRad * (in.setpointRad - in.angleRad) +
-                                         cfg_.kdNmSPerRad * (setpointVel - vel));
+        const float errorRad = in.setpointRad - in.angleRad;
+        // While the setpoint moves, push along its direction so the joint doesn't
+        // brake (and stick again) each time it lurches slightly ahead; once it
+        // stops, ramp in toward the setpoint to settle on the target.
+        const float frictionDir = fabsf(setpointVel) > 1.0e-4f
+                                      ? signf(setpointVel)
+                                      : clampf(errorRad / cfg_.frictionRampRad, -1.0f, 1.0f);
+        // Static friction is well above sliding friction, so add the difference
+        // only while the joint is (nearly) still and behind the setpoint: it breaks
+        // free with little error, then drops to the sliding level instead of lurching.
+        const float stillness = expf(-(vel * vel) / (cfg_.frictionStribeckRadPerSec * cfg_.frictionStribeckRadPerSec));
+        const float breakawayNm = errorRad * frictionDir > 0.0f
+                                      ? (cfg_.frictionStaticNm - cfg_.frictionCompNm) * stillness
+                                      : 0.0f;
+        const float frictionNm = (cfg_.frictionCompNm + breakawayNm) * frictionDir;
+        float trackingNm = assistance * (cfg_.kpNmPerRad * errorRad +
+                                         cfg_.kdNmSPerRad * (setpointVel - vel) + frictionNm);
         // Assist only toward the final target, never away from it.
         const float targetDir = signf(in.targetRad - in.angleRad);
         if (trackingNm * targetDir < 0.0f) {

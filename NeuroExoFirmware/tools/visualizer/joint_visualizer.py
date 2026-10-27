@@ -32,7 +32,7 @@ from trial_logger import TrialCsvLogger
 DEFAULT_MIN_DEG = -150.0
 DEFAULT_MAX_DEG = 80.0
 MIN_PLOT_SECONDS = 5.0  # x-axis span before a trial grows past it
-MODE_NAMES = {0: "Resistive", 1: "Assistive", 2: "Neutral", 3: "Calibrate"}
+MODE_NAMES = {0: "Resistive", 1: "Assistive", 2: "Neutral", 3: "Calibrate", 4: "Demo", 5: "Home"}
 SPEED_NAMES = {0: "Slow", 1: "Medium", 2: "High"}
 DEFAULT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry_data")
 ELBOW_AXIS = np.array([0.0, 1.0, 0.0])  # the 3D joint rotates about +y
@@ -189,6 +189,7 @@ class TrialTracker:
                 self.setting = self.stream.setting
                 self.count += 1
             if active:
+                self.target_deg = self.stream.target_deg  # Demo changes target each leg
                 self._record(sample)
                 changed = True
             elif self.running:
@@ -213,7 +214,7 @@ class TrialTracker:
         if self.mode is None:
             return "-"
         name = MODE_NAMES.get(self.mode, f"mode {self.mode}")
-        if self.mode == 2:
+        if self.mode in (2, 4, 5):
             return f"{name} {SPEED_NAMES.get(self.setting, self.setting)}"
         if self.mode in (0, 1):
             return f"{name} {self.setting * 10}%"

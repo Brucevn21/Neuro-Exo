@@ -88,6 +88,8 @@ const char *modeName(Mode mode) {
     case Mode::Assistive: return "Assistive";
     case Mode::Neutral: return "Neutral";
     case Mode::Calibrate: return "Calibrate";
+    case Mode::Demo: return "Demo";
+    case Mode::Home: return "Home";
     default: return "Unknown";
   }
 }
@@ -115,12 +117,15 @@ void printReceivedCommand(const uint8_t *frame, uint8_t length, const ControlPac
     Serial.print(frame[i], HEX);
   }
   Serial.println("]");
-  Serial.print("Target Angle: ");
-  Serial.print(command.targetAngleDeg);
-  Serial.println(" deg");
+  // Demo and Home pick their own targets.
+  if (command.mode != Mode::Demo && command.mode != Mode::Home) {
+    Serial.print("Target Angle: ");
+    Serial.print(command.targetAngleDeg);
+    Serial.println(" deg");
+  }
   Serial.print("Mode: ");
   Serial.println(modeName(command.mode));
-  if (command.mode == Mode::Neutral) {
+  if (command.mode == Mode::Neutral || command.mode == Mode::Demo || command.mode == Mode::Home) {
     Serial.print("Speed: ");
     Serial.println(speedName(static_cast<Speed>(command.setting)));
   } else if (command.mode != Mode::Calibrate) {

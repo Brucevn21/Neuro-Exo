@@ -21,6 +21,16 @@ Write one packet once to the BLE command characteristic `2A56` (ideally as a wri
 
 **Stop** (any mode): `02 12 00 7D 03`
 
+### Demo and Home
+
+Demo sweeps the arm 0° → 70° → 0° with **no one attached** (moving to 0° first if needed). Home moves the arm to 0°. Both ignore the target angle and, like other trials, are ignored while a trial is running, so send Stop first.
+
+| Speed | Demo | Home |
+| --- | --- | --- |
+| Slow (3 °/s) | `02 10 04 04 00 00 00 49 03` | `02 10 04 05 00 00 00 5F 03` |
+| Medium (7 °/s) | `02 10 04 04 01 00 00 22 03` | `02 10 04 05 01 00 00 34 03` |
+| High (15 °/s) | `02 10 04 04 02 00 00 9F 03` | `02 10 04 05 02 00 00 89 03` |
+
 ### Assistive (patient-driven)
 
 | Level | 60° | 0° | -40° |
@@ -49,13 +59,13 @@ Write one packet once to the BLE command characteristic `2A56` (ideally as a wri
 | 8 (80%) | `02 10 04 00 08 00 3C F4 03` | `02 10 04 00 08 00 00 40 03` | `02 10 04 00 08 FF D8 91 03` |
 | 9 (90%) | `02 10 04 00 09 00 3C 9F 03` | `02 10 04 00 09 00 00 2B 03` | `02 10 04 00 09 FF D8 FA 03` |
 
-### Neutral (robot-driven timed move)
+### Neutral (robot-driven constant-speed move)
 
 | Speed | 60° | 0° | -40° |
 | --- | --- | --- | --- |
-| Slow (20 s) | `02 10 04 02 00 00 3C 89 03` | `02 10 04 02 00 00 00 3D 03` | `02 10 04 02 00 FF D8 EC 03` |
-| Medium (12 s) | `02 10 04 02 01 00 3C E2 03` | `02 10 04 02 01 00 00 56 03` | `02 10 04 02 01 FF D8 87 03` |
-| High (6 s) | `02 10 04 02 02 00 3C 5F 03` | `02 10 04 02 02 00 00 EB 03` | `02 10 04 02 02 FF D8 3A 03` |
+| Slow (3 °/s) | `02 10 04 02 00 00 3C 89 03` | `02 10 04 02 00 00 00 3D 03` | `02 10 04 02 00 FF D8 EC 03` |
+| Medium (7 °/s) | `02 10 04 02 01 00 3C E2 03` | `02 10 04 02 01 00 00 56 03` | `02 10 04 02 01 FF D8 87 03` |
+| High (15 °/s) | `02 10 04 02 02 00 3C 5F 03` | `02 10 04 02 02 00 00 EB 03` | `02 10 04 02 02 FF D8 3A 03` |
 
 ## Wiring
 

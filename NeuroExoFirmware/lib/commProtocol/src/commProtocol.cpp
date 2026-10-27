@@ -52,7 +52,9 @@ bool isStopFrame(const Frame &frame) {
 
 static bool settingValidForMode(Mode mode, uint8_t setting) {
     switch (mode) {
-        case Mode::Neutral:   return setting <= static_cast<uint8_t>(Speed::High);
+        case Mode::Neutral:
+        case Mode::Demo:
+        case Mode::Home:      return setting <= static_cast<uint8_t>(Speed::High);
         case Mode::Assistive:
         case Mode::Resistive: return setting >= MIN_LEVEL && setting <= MAX_LEVEL;
         case Mode::Calibrate: return true;
@@ -62,7 +64,7 @@ static bool settingValidForMode(Mode mode, uint8_t setting) {
 
 bool decodeControlFrame(const Frame &frame, ControlPacket &packet) {
     if (frame.type != MESSAGE_CONTROL || frame.length != CONTROL_PAYLOAD_SIZE ||
-        frame.payload[0] > static_cast<uint8_t>(Mode::Calibrate) ||
+        frame.payload[0] > static_cast<uint8_t>(Mode::Home) ||
         !settingValidForMode(static_cast<Mode>(frame.payload[0]), frame.payload[1])) {
         return false;
     }

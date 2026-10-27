@@ -34,7 +34,9 @@ enum class Mode : uint8_t {
     Resistive = 0,  // Robot moves toward the target while the patient pushes against it
     Assistive = 1,  // Patient-driven: robot speed follows the patient's effort
     Neutral = 2,    // Robot-driven timed move (passive range of motion)
-    Calibrate = 3   // Relaxed baseline sweep to the target and back
+    Calibrate = 3,  // Relaxed baseline sweep to the target and back
+    Demo = 4,       // No one attached: timed sweep 0 -> 70 -> 0 deg (target ignored)
+    Home = 5        // Timed move to 0 deg (target ignored)
 };
 
 enum class Speed : uint8_t {
@@ -49,9 +51,9 @@ constexpr uint8_t MAX_LEVEL = 9;
 
 struct __attribute__((packed)) ControlPacket {
     Mode mode = Mode::Neutral;
-    // Neutral: Speed (0..2). Assistive/Resistive: level (1..9). Calibrate: unused (0).
+    // Neutral/Demo/Home: Speed (0..2). Assistive/Resistive: level (1..9). Calibrate: unused (0).
     uint8_t setting = static_cast<uint8_t>(Speed::Medium);
-    int16_t targetAngleDeg = 0;
+    int16_t targetAngleDeg = 0;  // ignored by Demo and Home
 };
 
 struct __attribute__((packed)) TelemetryPacket {

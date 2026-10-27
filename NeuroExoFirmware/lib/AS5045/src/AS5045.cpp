@@ -203,6 +203,7 @@ void AS5045::clock_cycle ()
 unsigned int AS5045::read ()
 {
   digitalWrite (_pinCS, LOW) ;
+  delayMicroseconds (1) ;  // CSn falling to first CLK falling must be >= 500 ns
   unsigned int value = 0 ;
   for (byte i = 0 ; i < 12 ; i++)
   {
@@ -216,7 +217,8 @@ unsigned int AS5045::read ()
     status = (status << 1) | digitalRead (_pinDO) ;
   }
   digitalWrite (_pinCS, HIGH) ;
-  _parity = even_parity (value >> 2) ^ even_parity (value & 3) ^ even_parity (status) ;
+  // Even parity over all 18 bits; even_parity() takes a byte, so split the 12-bit value.
+  _parity = even_parity (value >> 8) ^ even_parity (value & 0xFF) ^ even_parity (status) ;
   _status = status >> 1 ;
   return value ;
 }
@@ -257,6 +259,11 @@ byte AS5045::even_parity (byte val)
 byte AS5045::status ()
 {
   return _status ;
+}
+
+boolean AS5045::parityOk ()
+{
+  return _parity == 0 ;
 }
 
 // indicate if latest status implies valid data
