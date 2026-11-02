@@ -3,7 +3,8 @@
 
 Original reader modes use only the standard library. TCP sends command 0 only.
 Bluetooth mode receives Classic RFCOMM; it does not connect to a BLE service.
-ble-scan / ble-monitor / ble-control use the framed NeuroExo BLE service.
+ble-benchmark tests numbered packets through Nano/Teensy (see BLE_BENCHMARK.md).
+ble-scan / ble-monitor / ble-control use the normal NeuroExo motor service.
 CAL, TEST, RAW, and IMU records require an added exporter in the C++ producer.
 """
 
@@ -124,6 +125,25 @@ def listen_bluetooth(args):
                     display(read_record(stream))
 
 
+def demo():
+    print("Synthetic format examples only; no hardware is accessed.", file=sys.stderr)
+    examples = [
+        "[TOP OF MAIN]SENS_ACC: 6384, SENS_GYR: 131",
+        "0.00001;0.00002;0.00003;0.00004;0.00005;0.00006;0.00007;0.00008",
+        "0.00001,0.00002,0.00003,0.00004,0.00005,12.5,1,0",
+        "0\t0.125\t12.500\t0.500",
+        "MODEL_FILE: /example/subject_model/model.pkl",
+        # The following records illustrate proposed stdout exporters.
+        "RAW,0.00001,0.00002,0.00003,0.00004,0.00005,0.00006,0.00007,0.00008",
+        "IMU: 0.1 0.2 0.3 0.4 0.5 0.6",
+        "CAL,1,2,3,4,5,6,7,8,0.1,0.2,0.3,12.5,1,0",
+        "TEST,1,2,3,4,5,6,7,8,0.1,0.2,0.3,12.5,1,1,0",
+        "CAL," + ",".join(["9999"] * 14),
+    ]
+    for line in examples:
+        display(line)
+
+
 def positive_float(value):
     result = float(value)
     if not math.isfinite(result) or result <= 0:
@@ -135,7 +155,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest="mode", required=True)
     from neuroexo_motor import add_modes, run as run_motor
+    from ble_benchmark import add_mode, run as run_benchmark
     add_modes(modes)
+    add_mode(modes)
+    modes.add_parser("demo", help="show synthetic examples without hardware")
     modes.add_parser("stdin", help="read logs or telemetry from a pipe or redirected file")
     tcp = modes.add_parser("tcp", help="poll the documented robot TCP status interface")
     tcp.add_argument("host", help="robot IP address or hostname")
@@ -147,13 +170,17 @@ def main():
     bt.add_argument("--bind", default="00:00:00:00:00:00", help="local adapter MAC; default: any")
     bt.add_argument("--channel", type=int, default=1, choices=range(1, 31))
     args = parser.parse_args()
+    if args.mode == "ble-benchmark":
+        return run_benchmark(args)
     if args.mode in ("protocol-decode", "ble-scan", "ble-monitor", "ble-control"):
         return run_motor(args)
     if args.mode == "tcp" and (args.count < 0 or not 1 <= args.port <= 65535):
         parser.error("--count must be nonnegative and --port must be between 1 and 65535")
 
     try:
-        if args.mode == "stdin":
+        if args.mode == "demo":
+            demo()
+        elif args.mode == "stdin":
             for line in sys.stdin:
                 display(line)
         elif args.mode == "tcp":

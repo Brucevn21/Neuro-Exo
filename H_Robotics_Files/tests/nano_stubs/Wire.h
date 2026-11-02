@@ -1,4 +1,5 @@
 #pragma once
+#include "Arduino.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +10,9 @@ struct WireStub {
   size_t position = 0;
   uint8_t result = 0;
   void begin() {}
+  void begin(int) {}
+  void onReceive(void (*)(int)) {}
+  void onRequest(void (*)()) {}
   void setClock(unsigned) {}
   void beginTransmission(uint8_t address) { assert(address == 0x08); sent.clear(); }
   size_t write(const uint8_t* p, size_t size) { sent.assign(p, p + size); return size; }

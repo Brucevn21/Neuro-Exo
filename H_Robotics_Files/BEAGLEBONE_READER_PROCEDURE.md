@@ -1,10 +1,19 @@
 # BeagleBone motor control and telemetry
 
-Use the updated Nano bridge with the Teensy I2C firmware described in
-[NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md). The Teensy `src/main.cpp` imported
-from `main` still uses the legacy three-byte angle command and does not provide
-I2C telemetry. Use your separately supplied framed-protocol Teensy firmware for
-this path; building the repository's `teensy41` environment does not provide it.
+For the **250 packets/s BeagleBone/Nano trial using C++ and BlueZ**, start with
+[BLUEZ_TRIAL.md](BLUEZ_TRIAL.md). It includes the matching Nano firmware, a source
+transfer bundle, fresh-terminal build commands and packet-loss reporting, without Bleak.
+
+For the communication-only 250 Hz send/receive test, use the separate
+[packet demo guide](BLE_BENCHMARK.md). It starts from a fresh terminal and covers
+PlatformIO activation in WSL/Windows, both firmware uploads, copying the scripts,
+SSH from WSL to the BeagleBone, packet-loss reporting and restoration instructions.
+
+Use both firmware environments from [NeuroExoFirmware](../NeuroExoFirmware/README.md),
+integrated from `ProtocolDemo`. The Teensy now accepts the framed commands and
+returns I2C telemetry described in [NEUROEXO_PROTOCOL.md](NEUROEXO_PROTOCOL.md).
+Neutral disables motion. Motion remains disabled until the Teensy's
+`ESCON_FULL_SCALE_CURRENT_A` is configured for the actual motor driver.
 
 ## Nano
 
@@ -21,6 +30,19 @@ The Nano entry point is `NeuroExoFirmware/src/nanoBridge.cpp`. The shared codec
 lives alongside it in `commProtocol.cpp` and `commProtocol.h`. PlatformIO selects
 these files for the `nano33ble` environment and installs ArduinoBLE automatically.
 Serial diagnostics use 115200 baud. The bridge does not wait for USB Serial.
+Opening its monitor prints a ready message and periodic angle/current/status
+readings, or a waiting-for-Teensy message when I2C telemetry is missing/invalid.
+
+Build and upload the Teensy environment separately:
+
+```sh
+pio run -d NeuroExoFirmware -e teensy41
+pio run -d NeuroExoFirmware -e teensy41 -t upload
+```
+
+Uploading is required on both boards after this firmware update. The Teensy
+encoder pins from `ProtocolDemo` are DATA=0, CLK=1, CS=2; verify the
+[connection map](../NeuroExoFirmware/lib/pinMap/README.md) against the actual wiring.
 
 ## Python on the BeagleBone
 
@@ -52,7 +74,9 @@ This sends actual motor controls, with degrees and speed interpreted by your
 Teensy controller. All three control fields and a positive duration are required.
 The wire supports −32768..32767 degrees; this is an encoding range, not a
 mechanical travel limit. The Teensy remains responsible for configured limits.
-`neutral` is mode 2. At completion or Ctrl+C, the control tool attempts Neutral.
+`neutral` is mode 2 and disables motion. At completion or Ctrl+C, the control
+tool attempts Neutral. Identical heartbeat frames keep the watchdog alive
+without restarting the trajectory.
 
 Add `--log motor-session.jsonl` to either mode to write a new JSONL file of decoded
 values and raw hex. Existing files are not overwritten. `--duration 10` limits a

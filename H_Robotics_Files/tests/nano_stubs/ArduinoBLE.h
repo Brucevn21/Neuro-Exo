@@ -1,16 +1,8 @@
 #pragma once
+#include "Arduino.h"
 #include <algorithm>
 #include <cstdint>
 #include <vector>
-inline uint32_t fakeMillis = 0;
-inline uint32_t millis() { return fakeMillis; }
-inline void delay(unsigned ms) { fakeMillis += ms; }
-struct SerialStub {
-  void begin(int) {}
-  operator bool() const { return true; }
-  void println(const char*) {}
-};
-inline SerialStub Serial;
 constexpr int BLEWrite = 1, BLENotify = 2, BLEDisconnected = 3;
 struct BLEDevice {};
 class BLECharacteristic {

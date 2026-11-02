@@ -21,24 +21,25 @@ Implementation references:
 - [Protocol implementation](NeuroExoFirmware/src/commProtocol.cpp)
 - [BeagleBone interface](H_Robotics_Files/Hardware_Interface.hpp)
 
-PlatformIO's `nano33ble` environment builds the framed bridge. The older
-[Nano sketch](NeuroExoFirmware/src/Nano33BLEFirmware.ino) is retained from `main`
-but excluded from that build. The old BLE benchmark tools, simulated trial
-protocol, and `DemoFolder` have been removed.
+PlatformIO's `nano33ble` and `teensy41` environments build the matching framed
+bridge and controller, integrated from `ProtocolDemo` (`e3ee844`). The old BLE
+benchmark tools, simulated trial protocol, `DemoFolder`, and obsolete Nano
+sketch have been removed.
 
-**Teensy compatibility:** the [Teensy controller](NeuroExoFirmware/src/main.cpp)
-imported from `main` still accepts the legacy three-byte `0x01` angle command.
-It does not yet decode the framed protocol or return I2C telemetry. The framed
-Nano/BeagleBone path requires the separately supplied Teensy firmware implementing
-the protocol above; the two firmware environments in this checkout are not yet
-a matching control/telemetry pair.
+The [Teensy controller](NeuroExoFirmware/src/main.cpp) validates control frames,
+returns angle/current/status telemetry, and disables motion after 250 ms without
+a valid command. **Neutral is stop.** Nano USB diagnostics show telemetry or a
+waiting-for-Teensy message once per second at 115200 baud.
+The controller stays disabled until `ESCON_FULL_SCALE_CURRENT_A` matches the
+actual ESCON configuration. See the [firmware guide](NeuroExoFirmware/README.md)
+for build instructions and the integration differences.
 
 ## Dynamic force control for motor assistance
 
-The Teensy 4.1 controller imported from `main` includes an assist algorithm that
-adjusts motor output using joint velocity, acceleration, and motor current as an
-effort signal. It combines trajectory/PID output with assist modulation,
-filtering, and slew-rate limiting.
+The Teensy 4.1 controller from `ProtocolDemo` computes assistive tracking torque
+or resistive damping torque and converts it to motor current. It includes
+velocity filtering, current/torque limits, and latched overspeed/overcurrent
+faults. Neutral bypasses the controller and disables the motor.
 
 Implementation references:
 
@@ -51,7 +52,8 @@ Implementation references:
 The project includes firmware for a power management subsystem on an Arduino
 Nano 33 BLE, with a relay for load connection/disconnection, a buck-converted
 supply path, and polarity protection hardware. Its firmware provides
-under-voltage protection with hysteresis-based relay control.
+under/over-voltage protection with hysteresis-based relay control. The active
+Nano bridge also includes this protection on A3 (voltage sense) and D5 (relay).
 
 Implementation reference:
 

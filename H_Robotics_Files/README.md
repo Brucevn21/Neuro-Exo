@@ -7,6 +7,8 @@ and MotionActive, CommandTimeout, InvalidCommand, and SafetyFault status bits.
 
 - [Protocol and UUIDs](NEUROEXO_PROTOCOL.md)
 - [Build, flash, monitor, and control instructions](BEAGLEBONE_READER_PROCEDURE.md)
+- [250 packets/s Nano-only trial using C++ and BlueZ (no Bleak)](BLUEZ_TRIAL.md)
+- [250 Hz packet demo and loss reporting](BLE_BENCHMARK.md)
 - [Nano BLE/I2C bridge](../NeuroExoFirmware/src/nanoBridge.cpp)
 - [C++ application interface](Hardware_Interface.hpp)
 
@@ -19,7 +21,8 @@ python3 read_outputs.py ble-monitor --address AA:BB:CC:DD:EE:FF --hex
 
 The 9-byte command and 10-byte telemetry formats match the supplied Teensy
 `commProtocol.cpp`. The former simulated trial protocol, synthetic traffic
-generators, and benchmark sketches/tools have been retired.
+generators, and benchmark sketches/tools have been retired. The new
+[packet demo](BLE_BENCHMARK.md) uses separate, opt-in firmware builds.
 
 `main.cpp` and `Hardware_Interface.*` are a partial copy of the original EEG/EOG
 application. Several drivers, calibration/testing modules, and training scripts

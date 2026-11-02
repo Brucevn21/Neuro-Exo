@@ -1,4 +1,6 @@
 #include "BleMotorClient.hpp"
+#include "PacketGatt.hpp"
+#include "../NeuroExoFirmware/src/packetDemoProtocol.h"
 #include <gio/gio.h>
 #include <algorithm>
 #include <cctype>
@@ -43,9 +45,11 @@ std::string normalizeAddress(std::string address) {
   }
   return address;
 }
-class BluezGatt final : public GattTransport {
+class BluezGatt final : public GattTransport, public PacketGatt {
  public:
   explicit BluezGatt(std::string testBus = {}) : testBus_(std::move(testBus)) {}
+  BluezGatt(Notification callback, std::string testBus)
+      : testBus_(std::move(testBus)), packetCallback_(std::move(callback)) {}
   ~BluezGatt() override { disconnect(); }
 
   void connect(const std::string& rawAddress, const std::string& adapter) override {
@@ -82,7 +86,7 @@ class BluezGatt final : public GattTransport {
       } while (std::chrono::steady_clock::now() < deadline);
       call(adapter_, "org.bluez.Adapter1", "StopDiscovery", nullptr);
       discovering = false;
-      if (device_.empty()) throw std::runtime_error("Nano not discovered; verify power and NanoNeuroExo firmware");
+      if (device_.empty()) throw std::runtime_error("Nano not discovered; verify power, firmware and Bluetooth address");
       if (booleanProperty(device_, "org.bluez.Device1", "Connected"))
         throw std::runtime_error("Nano already connected; disconnect the Python reader/other BLE client");
       // Mark ownership before Connect: a timed-out Connect may have succeeded.
@@ -130,6 +134,37 @@ class BluezGatt final : public GattTransport {
   bool connected() const override {
     std::lock_guard<std::mutex> guard(replyMutex_);
     return online_ && failure_.empty();
+  }
+
+  void writePacket(const std::vector<uint8_t>& raw, bool control) override {
+    std::lock_guard<std::mutex> operation(operationMutex_);
+    if (!packetCallback_ || !connected()) throw std::runtime_error("packet service is not connected");
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(&options, "{sv}", "type", g_variant_new_string(control ? "request" : "command"));
+    auto* bytes = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, raw.data(), raw.size(), 1);
+    try {
+      call(control ? control_ : command_, "org.bluez.GattCharacteristic1", "WriteValue",
+           g_variant_new("(@aya{sv})", bytes, &options), 1000);
+    } catch (...) {
+      failed("Packet write failed; delivery is unknown");
+      throw;
+    }
+  }
+
+  std::vector<uint8_t> readStatistics() override {
+    std::lock_guard<std::mutex> operation(operationMutex_);
+    if (!packetCallback_ || !connected()) throw std::runtime_error("packet service is not connected");
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    auto reply = call(stats_, "org.bluez.GattCharacteristic1", "ReadValue",
+                      g_variant_new("(a{sv})", &options), 1000);
+    auto bytes = own(g_variant_get_child_value(reply.get(), 0));
+    if (!g_variant_is_of_type(bytes.get(), G_VARIANT_TYPE("ay")))
+      throw std::runtime_error("invalid statistics reply type");
+    gsize size = 0;
+    auto* raw = static_cast<const uint8_t*>(g_variant_get_fixed_array(bytes.get(), &size, 1));
+    return size ? std::vector<uint8_t>(raw, raw + size) : std::vector<uint8_t>{};
   }
 
   void writeControl(const ControlPacket& request, int timeoutMs) override {
@@ -204,6 +239,7 @@ class BluezGatt final : public GattTransport {
     bus_ = nullptr; loop_ = nullptr; context_ = nullptr; closedHandler_ = 0;
     eventSubscription_ = deviceSubscription_ = ownerSubscription_ = 0;
     adapter_.clear(); device_.clear(); command_.clear(); event_.clear();
+    control_.clear(); stats_.clear();
   }
 
  private:
@@ -255,26 +291,36 @@ class BluezGatt final : public GattTransport {
   void discoverCharacteristics() {
     std::string service;
     objects("org.bluez.GattService1", [&](const std::string& path, GVariant* p) {
-      if (stringProperty(p, "Device") == device_ && stringProperty(p, "UUID") == SERVICE_UUID) {
+      if (stringProperty(p, "Device") == device_ &&
+          stringProperty(p, "UUID") == (packetCallback_ ? packetdemo::SERVICE : SERVICE_UUID)) {
         if (!service.empty()) throw std::runtime_error("ambiguous Nano motor service");
         service = path;
       }
     });
-    if (service.empty()) throw std::runtime_error("Nano motor service missing; flash NeuroExoFirmware with the nano33ble environment");
+    if (service.empty()) throw std::runtime_error(packetCallback_
+        ? "Packet service missing; upload nano33ble_packet_loopback firmware"
+        : "Nano motor service missing; flash NeuroExoFirmware with the nano33ble environment");
     objects("org.bluez.GattCharacteristic1", [&](const std::string& path, GVariant* p) {
       if (stringProperty(p, "Service") != service) return;
       const std::string uuid = stringProperty(p, "UUID");
       std::string* destination = nullptr;
       const char* property = nullptr;
-      if (uuid == COMMAND_UUID) { destination = &command_; property = "write"; }
-      if (uuid == TELEMETRY_UUID) { destination = &event_; property = "notify"; }
+      if (packetCallback_) {
+        if (uuid == packetdemo::TX) { destination = &command_; property = "write-without-response"; }
+        if (uuid == packetdemo::RX) { destination = &event_; property = "notify"; }
+        if (uuid == packetdemo::CONTROL) { destination = &control_; property = "write"; }
+        if (uuid == packetdemo::STATS) { destination = &stats_; property = "read"; }
+      } else {
+        if (uuid == COMMAND_UUID) { destination = &command_; property = "write"; }
+        if (uuid == TELEMETRY_UUID) { destination = &event_; property = "notify"; }
+      }
       if (destination) {
         if (!destination->empty() || !flag(p, property))
           throw std::runtime_error("Nano characteristic flags or uniqueness mismatch");
         *destination = path;
       }
     });
-    if (command_.empty() || event_.empty())
+    if (command_.empty() || event_.empty() || (packetCallback_ && (control_.empty() || stats_.empty())))
       throw std::runtime_error("Nano protocol characteristics missing");
   }
   void failed(const std::string& reason) {
@@ -310,6 +356,10 @@ class BluezGatt final : public GattTransport {
       if (!value) return;
       gsize length = 0;
       const auto* raw = static_cast<const uint8_t*>(g_variant_get_fixed_array(value.get(), &length, 1));
+      if (self->packetCallback_) {
+        if (self->connected()) self->packetCallback_(raw, length);
+        return;
+      }
       Telemetry telemetry;
       // Discard corrupt, truncated, oversized, or wrong-direction notifications.
       // Invalid frames do not refresh the timestamp or overwrite valid feedback.
@@ -323,6 +373,8 @@ class BluezGatt final : public GattTransport {
   }
 
   std::string testBus_, adapter_, device_, command_, event_, failure_;
+  std::string control_, stats_;
+  Notification packetCallback_;
   GDBusConnection* bus_ = nullptr;
   GMainContext* context_ = nullptr;
   GMainLoop* loop_ = nullptr;
@@ -342,5 +394,9 @@ std::unique_ptr<GattTransport> makeBluezGatt() {
 // Test helper uses a private Unix D-Bus daemon, never the machine's Bluetooth.
 std::unique_ptr<GattTransport> makeBluezGattForTests(const std::string& busAddress) {
   return std::unique_ptr<GattTransport>(new BluezGatt(busAddress));
+}
+std::unique_ptr<PacketGatt> makePacketGatt(PacketGatt::Notification callback, const std::string& testBus) {
+  if (!callback) throw std::invalid_argument("packet notification callback required");
+  return std::unique_ptr<PacketGatt>(new BluezGatt(std::move(callback), testBus));
 }
 }  // namespace neuroexo

@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Trial telemetry logs from tools/visualizer (local calibration data)
+telemetry_data/
+trial_run_*.csv
+.trial_in_progress.csv
+__pycache__/

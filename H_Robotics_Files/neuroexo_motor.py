@@ -83,8 +83,9 @@ class Trace:
 
     def frame(self, direction, frame, raw, received_at=None):
         stamp = (time.monotonic() if received_at is None else received_at) - self.origin
+        raw_hex = " ".join(f"{value:02x}" for value in raw) if self.show_hex else ""
         print(f"{stamp:9.3f}s {direction} {frame.describe()}"
-              + (f" | {raw.hex(' ')}" if self.show_hex else ""), flush=True)
+              + (f" | {raw_hex}" if self.show_hex else ""), flush=True)
         if self.stream:
             record = dict(time_s=stamp, clock="host_monotonic", direction=direction,
                           **asdict(frame), hex=raw.hex())

@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Shared by the Nano bridge and BeagleBone client. No Arduino dependency.
+// Shared by the Teensy, Nano bridge, and BeagleBone client. No Arduino dependency.
 namespace neuroexo {
 constexpr uint8_t STX = 0x02, ETX = 0x03;
 constexpr uint8_t CONTROL_TYPE = 0x10, TELEMETRY_TYPE = 0x11;

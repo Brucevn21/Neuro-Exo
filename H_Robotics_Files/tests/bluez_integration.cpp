@@ -1,6 +1,8 @@
 // Exercises the actual BlueZ D-Bus client against an isolated fake org.bluez.
 // No system Bluetooth adapter or external network is accessed.
 #include "../BleMotorClient.hpp"
+#include "../PacketGatt.hpp"
+#include "../PacketTrial.hpp"
 #include <gio/gio.h>
 #include <atomic>
 #include <condition_variable>
@@ -20,6 +22,8 @@ const char* device = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF";
 const char* service = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001";
 const char* command = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0001";
 const char* event = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0002";
+const char* demoControl = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0003";
+const char* demoStats = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0004";
 const char* xml = R"XML(
 <node>
 <interface name="org.freedesktop.DBus.ObjectManager">
@@ -55,6 +59,7 @@ void check(bool value, const char* message) { if (!value) throw std::runtime_err
 class FakeBluez {
  public:
   std::atomic<bool> drop{false}, corrupt{false}, disconnectOnWrite{false}, badFlags{false};
+  std::atomic<bool> packetMode{false};
   std::atomic<unsigned> writes{0};
   FakeBluez() {
     daemon_ = g_test_dbus_new(G_TEST_DBUS_NONE);
@@ -89,6 +94,9 @@ class FakeBluez {
     if (!std::strcmp(name, "Device")) return g_variant_new_object_path(device);
     if (!std::strcmp(name, "Service")) return g_variant_new_object_path(service);
     if (!std::strcmp(name, "UUID")) {
+      if (packetMode) return g_variant_new_string(path == service ? packetdemo::SERVICE :
+          path == command ? packetdemo::TX : path == event ? packetdemo::RX :
+          path == demoControl ? packetdemo::CONTROL : packetdemo::STATS);
       const char* uuid = path == service ? "b7e20000-6a2b-4f10-9c31-8b674045a901" :
                          path == command ? "b7e20001-6a2b-4f10-9c31-8b674045a901" :
                          path == event ? "b7e20002-6a2b-4f10-9c31-8b674045a901" :
@@ -96,6 +104,11 @@ class FakeBluez {
       return g_variant_new_string(uuid);
     }
     if (!std::strcmp(name, "Flags")) {
+      if (packetMode) {
+        const char* flags[] = {path == command ? (badFlags ? "read" : "write-without-response") :
+                              path == event ? "notify" : path == demoControl ? "write" : "read", nullptr};
+        return g_variant_new_strv(flags, -1);
+      }
       const char* flags[] = {path == command ? (badFlags ? "read" : "write") :
                             path == event ? "notify" : "read", nullptr};
       return g_variant_new_strv(flags, -1);
@@ -122,7 +135,7 @@ class FakeBluez {
   GVariant* managed() {
     GVariantBuilder objects;
     g_variant_builder_init(&objects, G_VARIANT_TYPE("a{oa{sa{sv}}}"));
-    for (const auto path : {adapter, device, service, command, event}) {
+    for (const auto path : {adapter, device, service, command, event, demoControl, demoStats}) {
       GVariantBuilder interfaces;
       g_variant_builder_init(&interfaces, G_VARIANT_TYPE("a{sa{sv}}"));
       g_variant_builder_add(&interfaces, "{s@a{sv}}", interfaceFor(path), properties(path));
@@ -154,6 +167,47 @@ class FakeBluez {
     }
     if (name == "StartNotify") notifying_ = true;
     if (name == "StopNotify") notifying_ = false;
+    if (packetMode && name == "ReadValue") {
+      check(path == demoStats, "statistics read from wrong characteristic");
+      uint8_t raw[packetdemo::STATS_SIZE];
+      for (size_t i = 0; i < stats_.size(); ++i) packetdemo::write32(raw + 3 + i*4, stats_[i]);
+      packetdemo::finish(raw, packetdemo::STATISTICS, sizeof(raw));
+      g_dbus_method_invocation_return_value(invocation, g_variant_new("(@ay)",
+          g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, raw, sizeof(raw), 1)));
+      return;
+    }
+    if (packetMode && name == "WriteValue") {
+      check(notifying_, "packet write before subscription");
+      GVariant* bytes = g_variant_get_child_value(params, 0);
+      GVariant* options = g_variant_get_child_value(params, 1);
+      const gchar* type = nullptr;
+      const bool correctMode = g_variant_lookup(options, "type", "&s", &type) &&
+          std::strcmp(type, path == demoControl ? "request" : "command") == 0;
+      g_variant_unref(options);
+      gsize length = 0;
+      const auto* raw = static_cast<const uint8_t*>(g_variant_get_fixed_array(bytes, &length, 1));
+      check(length == packetdemo::PACKET_SIZE, "invalid packet size");
+      const uint8_t kind = raw[1]; const uint32_t value = packetdemo::read32(raw + 3);
+      const bool valid = packetdemo::valid(raw, length, kind, packetdemo::PACKET_SIZE);
+      g_variant_unref(bytes);
+      check(correctMode && valid, "wrong packet write mode or CRC");
+      using namespace packetdemo;
+      if (path == demoControl) {
+        check(kind == START || kind == SNAPSHOT, "bad control kind");
+        if (kind == START) { stats_.fill(0); stats_[Session] = value; }
+        stats_[Token] = value; stats_[Ready] = 2;
+      } else {
+        check(path == command && kind == DATA, "wrong packet data characteristic");
+        ++stats_[NanoReceived]; ++stats_[EchoAttempts];
+        if (!drop) {
+          uint8_t echo[ECHO_SIZE]; write32(echo + 3, value); echo[7] = 1; finish(echo, ECHO, sizeof(echo));
+          if (corrupt) echo[8] ^= 1;
+          emit(event, "org.bluez.GattCharacteristic1", "Value",
+               g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, echo, sizeof(echo), 1));
+        }
+      }
+      g_dbus_method_invocation_return_value(invocation, g_variant_new("()")); return;
+    }
     if (name == "WriteValue") {
       check(path == command && notifying_, "write before notification subscription");
       GVariant* bytes = g_variant_get_child_value(params, 0);
@@ -213,7 +267,7 @@ class FakeBluez {
     check(node != nullptr, "introspection XML failed");
     static const GDBusInterfaceVTable vtable = {onMethod, onProperty, nullptr, {nullptr}};
     std::vector<guint> registrations;
-    for (const auto path : {"/", adapter, device, service, command, event}) {
+    for (const auto path : {"/", adapter, device, service, command, event, demoControl, demoStats}) {
       const auto* interface = interfaceFor(path);
       const guint id = g_dbus_connection_register_object(bus_, path,
         g_dbus_node_info_lookup_interface(node, interface), &vtable, this, nullptr, &error);
@@ -227,7 +281,7 @@ class FakeBluez {
     GSource* telemetryTimer = g_timeout_source_new(10);
     g_source_set_callback(telemetryTimer, [](gpointer p) -> gboolean {
       auto* self = static_cast<FakeBluez*>(p);
-      if (self->connected_ && self->notifying_ && !self->drop) {
+      if (!self->packetMode && self->connected_ && self->notifying_ && !self->drop) {
         uint8_t raw[neuroexo::TELEMETRY_SIZE];
         neuroexo::encodeTelemetry({-123, -1200, 15}, raw);
         if (self->corrupt) raw[8] ^= 1;
@@ -257,6 +311,7 @@ class FakeBluez {
   std::condition_variable cv_;
   bool ready_ = false, connected_ = false, notifying_ = false;
   std::string error_;
+  neuroexo::PacketStats stats_{};
 };
 template<class F> void rejects(F operation, const char* message) {
   try { operation(); } catch (const std::exception&) { return; }
@@ -298,8 +353,37 @@ int main() {
     client.disconnect();
     server.badFlags = true;
     rejects([&] { client.connect("AA:BB:CC:DD:EE:FF"); }, "bad characteristic flags accepted");
+    server.badFlags = false; server.packetMode = true;
+    neuroexo::PacketAccounting counts(250, 10);
+    auto packets = neuroexo::makePacketGatt([&](const uint8_t* raw, size_t size) {
+      counts.notification(raw, size);
+    }, server.address);
+    packets->connect("AA:BB:CC:DD:EE:FF", "hci0");
+    packets->writePacket(neuroexo::demoPacket(packetdemo::START, 123), true);
+    auto stats = neuroexo::decodePacketStats(packets->readStatistics());
+    check(stats[packetdemo::Ready] == 2 && stats[packetdemo::Session] == 123, "fresh reset missing");
+    counts.start(neuroexo::TrialClock::now());
+    for (unsigned i = 1; i <= 100; ++i) {
+      counts.attempted(i);
+      packets->writePacket(neuroexo::demoPacket(packetdemo::DATA, i), false);
+    }
+    const auto deadline = neuroexo::TrialClock::now() + std::chrono::seconds(2);
+    while (counts.received() != 100 && neuroexo::TrialClock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(counts.received() == 100, "packet notifications collapsed or lost");
+    server.drop = true;
+    counts.attempted(101); packets->writePacket(neuroexo::demoPacket(packetdemo::DATA, 101), false);
+    packets->writePacket(neuroexo::demoPacket(packetdemo::SNAPSHOT, 456), true);
+    stats = neuroexo::decodePacketStats(packets->readStatistics());
+    check(stats[packetdemo::Token] == 456 && stats[packetdemo::NanoReceived] == 101, "receiver count incorrect");
+    auto result = counts.finish(101, 10, stats, true);
+    check(result.consistent && !result.pass && result.missing == std::vector<uint32_t>{101},
+          "missing return packet was not accounted for");
+    packets->disconnect();
+    server.badFlags = true;
+    rejects([&] { packets->connect("AA:BB:CC:DD:EE:FF", "hci0"); }, "packet write flags unchecked");
     std::cout << "BlueZ integration: independent TX/RX, signed telemetry/status, CRC discard, "
-                 "stale feedback, disconnect, reconnect, discovery/flags PASS\n";
+                 "stale feedback, disconnect, reconnect, discovery/flags, packet burst/loss/statistics PASS\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

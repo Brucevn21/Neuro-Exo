@@ -122,10 +122,17 @@ that keeps responding with an old but valid frame.
 - [Hardware interface](Hardware_Interface.hpp): `sendMotorControl`, `stopMotor`,
   `readMotorTelemetry`, `latestMotorTelemetry`, `lastArmPositionDegrees`
 
-The supplied Teensy protocol is the compatibility reference. The Teensy
-`NeuroExoFirmware/src/main.cpp` imported from `main` still accepts the legacy
-three-byte `0x01` angle command and has no I2C telemetry response. It is not yet
-compatible with the framed bridge. Use the separately supplied Teensy firmware
-that implements the specified I2C protocol, watchdog, and safety flags.
+The Teensy controller in `NeuroExoFirmware/src/main.cpp` is integrated from
+`ProtocolDemo` (`e3ee844`) and uses the same strict codec as the Nano and C++
+BeagleBone client. Its I2C callbacks only buffer received bytes or transmit
+the prepared telemetry frame. The loop validates commands and publishes fresh
+angle/current/status snapshots.
+
+Neutral (mode 2) disables motion, preserving the BeagleBone stop behavior.
+Identical commands refresh the watchdog without restarting the trajectory.
+At 250 ms without valid commands, motion is disabled. A latched SafetyFault
+clears only after 250 ms without received command traffic, including invalid
+traffic. The controller's full-scale ESCON current remains unconfigured (zero)
+by default, preventing motor activation until calibrated.
 
 For setup, commands, and checks, see [the reader procedure](BEAGLEBONE_READER_PROCEDURE.md).
