@@ -1,0 +1,6 @@
+__pycache__/
+tests/__pycache__/
+.venv/
+build/
+build-ble/
+protocol_trace*.jsonl
