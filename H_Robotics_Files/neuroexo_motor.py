@@ -26,7 +26,11 @@ def add_modes(modes):
             parser.add_argument("--mode", dest="motor_mode", choices=[m.name.lower() for m in Mode], required=True)
             parser.add_argument("--speed", choices=[s.name.lower() for s in Speed], required=True)
             parser.add_argument("--angle", type=int, required=True, help="signed integer degrees")
-            parser.add_argument("--period-ms", type=int, default=100, help="command interval, 20..200 ms")
+            parser.add_argument("--period-ms", type=int, default=100, help="command interval, 4..200 ms")
+            parser.add_argument("--write-without-response", action="store_true",
+                                help="queue periodic writes without waiting for an ATT response")
+            parser.add_argument("--sequence-test", action="store_true",
+                                help="send incrementing targetAngle values for Nano BLE_PACKET_TEST mode")
 
 
 class BleLink:
@@ -69,11 +73,12 @@ class BleLink:
             raise TimeoutError("Teensy telemetry is stale")
         return update
 
-    async def send(self, command):
+    async def send(self, command, with_response=True):
         if self.failure:
             raise ConnectionError(self.failure)
         # This completion is an ATT response from Nano, not a Teensy acknowledgment.
-        await asyncio.wait_for(self.client.write_gatt_char(COMMAND, command.encode(), response=True), 0.1)
+        await asyncio.wait_for(self.client.write_gatt_char(
+            COMMAND, command.encode(), response=with_response), 0.1)
 
 
 class Trace:
@@ -101,15 +106,23 @@ async def monitor(link, trace, timeout, controlling=False):
             raise RuntimeError("Teensy reported SafetyFault or InvalidCommand; control transmission stopped")
 
 
-async def transmit(link, trace, command, period, freshness):
+async def transmit(link, trace, command, period, freshness,
+                   with_response=True, sequence_test=False):
     due = asyncio.get_running_loop().time()
+    sequence = 0
     while True:
         if link.latest is None or time.monotonic() - link.latest[0] > freshness:
             raise TimeoutError("Teensy telemetry missing or stale; control transmission stopped")
         if link.latest[1].status & (Status.SafetyFault | Status.InvalidCommand):
             raise RuntimeError("Teensy fault; control transmission stopped")
-        await link.send(command)
-        trace.frame("TX", command, command.encode())
+        current = command
+        if sequence_test:
+            angle = sequence if sequence < 0x8000 else sequence - 0x10000
+            # Keep the diagnostic inert if the test firmware was not flashed.
+            current = Control(Mode.Neutral, Speed.Slow, angle)
+            sequence = (sequence + 1) & 0xFFFF
+        await link.send(current, with_response)
+        trace.frame("TX", current, current.encode())
         due += period
         now = asyncio.get_running_loop().time()
         if due <= now:
@@ -128,7 +141,9 @@ async def run_connected(link, args, trace):
     if controlling:
         command = Control(Mode[args.motor_mode.title()], Speed[args.speed.title()], args.angle)
         tasks.append(asyncio.create_task(transmit(link, trace, command, args.period_ms / 1000,
-                                                 args.telemetry_timeout)))
+                                                 args.telemetry_timeout,
+                                                 not args.write_without_response,
+                                                 args.sequence_test)))
     if args.duration:
         tasks.append(asyncio.create_task(asyncio.sleep(args.duration)))
     try:
@@ -141,7 +156,7 @@ async def run_connected(link, args, trace):
         await asyncio.gather(*tasks, return_exceptions=True)
         # Receive-only monitoring never sends a stop. Avoid extending a fault latch.
         fault = link.latest and link.latest[1].status & Status.SafetyFault
-        if controlling and not link.failure and not fault:
+        if controlling and not args.sequence_test and not link.failure and not fault:
             try:
                 neutral = Control(Mode.Neutral, Speed.Slow, 0)
                 await link.send(neutral)
@@ -174,6 +189,9 @@ async def execute(args, stream=None):
             char = client.services.get_characteristic(uuid)
             if char is None or prop not in char.properties or char.service_uuid.lower() != SERVICE:
                 raise RuntimeError("Nano motor service mismatch; flash NeuroExoFirmware with the nano33ble environment")
+            if (uuid == COMMAND and getattr(args, "write_without_response", False) and
+                    "write-without-response" not in char.properties):
+                raise RuntimeError("Nano command characteristic does not support Write Without Response")
         await asyncio.wait_for(client.start_notify(TELEMETRY, link.notification), 10)
         trace = Trace(args.hex, stream)
         await run_connected(link, args, trace)
@@ -197,8 +215,10 @@ def run(args):
             if not math.isfinite(args.telemetry_timeout) or not 0.05 <= args.telemetry_timeout <= 10:
                 raise ValueError("telemetry timeout must be 0.05..10 seconds")
             if args.mode == "ble-control":
-                if args.duration <= 0 or not 20 <= args.period_ms <= 200:
-                    raise ValueError("control requires positive duration and period 20..200 ms")
+                if args.duration <= 0 or not 4 <= args.period_ms <= 200:
+                    raise ValueError("control requires positive duration and period 4..200 ms")
+                if args.sequence_test and not args.write_without_response:
+                    raise ValueError("--sequence-test requires --write-without-response")
                 Control(Mode[args.motor_mode.title()], Speed[args.speed.title()], args.angle).encode()
             if args.log:
                 stream = open(args.log, "x", encoding="utf-8")

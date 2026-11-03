@@ -70,6 +70,21 @@ python3 read_outputs.py ble-control --address AA:BB:CC:DD:EE:FF \
   --mode assistive --speed slow --angle 30 --duration 5 --period-ms 100 --hex
 ```
 
+When the Nano sketch has `BLE_PACKET_TEST` enabled, use this diagnostic
+command to send distinct packet sequence values over Write Without Response:
+
+```sh
+python3 read_outputs.py ble-control --address AA:BB:CC:DD:EE:FF \
+  --mode neutral --speed slow --angle 0 --duration 10 --period-ms 20 \
+  --write-without-response --sequence-test
+```
+
+In this firmware mode the Nano counts packets and does not forward them to the
+Teensy. `--sequence-test` increments the target angle in each frame because the
+Nano uses that field as its test sequence number; a fixed angle is counted as
+one unique packet followed by duplicates. Sequence-test frames use Neutral mode
+and the run still requires live telemetry for the control client's safety checks.
+
 This sends actual motor controls, with degrees and speed interpreted by your
 Teensy controller. All three control fields and a positive duration are required.
 The wire supports −32768..32767 degrees; this is an encoding range, not a
