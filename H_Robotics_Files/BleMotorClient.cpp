@@ -17,14 +17,17 @@ void BleMotorClient::connect(const std::string& address, const std::string& adap
 }
 void BleMotorClient::disconnect() noexcept { transport_->disconnect(); }
 bool BleMotorClient::connected() const { return transport_->connected(); }
-void BleMotorClient::sendControl(const Control& command) {
+void BleMotorClient::sendControl(const Control& command, bool withResponse) {
   ControlPacket raw{};
   if (!encodeControl(command, raw.data())) throw std::invalid_argument("invalid mode or speed");
   if (!connected()) throw std::runtime_error("Nano is disconnected");
-  // ATT success only confirms delivery to Nano, not application by Teensy.
-  transport_->writeControl(raw, 100);
+  // A write request confirms delivery to Nano, not application by Teensy.
+  // A write command skips that confirmation and only queues the BLE write.
+  transport_->writeControl(raw, 100, withResponse);
 }
-void BleMotorClient::stopMotor() { sendControl({Mode::Neutral, Speed::Slow, 0}); }
+void BleMotorClient::stopMotor() {
+  sendControl({Mode::Neutral, Speed::Slow, 0}, true);
+}
 std::optional<TelemetryUpdate> BleMotorClient::receiveTelemetry(int timeoutMs) {
   if (timeoutMs < 0 || timeoutMs > 10000) throw std::invalid_argument("timeout must be 0..10000 ms");
   return transport_->receiveTelemetry(timeoutMs);

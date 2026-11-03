@@ -1,5 +1,6 @@
 #include "BleMotorClient.hpp"
 #include <csignal>
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -18,6 +19,7 @@ int integer(const std::string& value) {
 int main(int argc, char** argv) {
   neuroexo::BleMotorClient client(neuroexo::makeBluezGatt());
   bool controlling = false;
+  bool writeWithoutResponse = false;
   bool controlStarted = false;
   bool fault = false;
   auto cleanup = [&] {
@@ -38,8 +40,14 @@ int main(int argc, char** argv) {
         std::cout << "neuroexo_motor --address AA:BB:CC:DD:EE:FF [--adapter hci0] [--duration seconds]\n"
                      "Default: receive and print real Teensy telemetry without sending commands.\n"
                      "Control: --mode resistive|assistive|neutral --speed slow|medium|high\n"
-                     "         --angle signed_integer_degrees --duration seconds [--period-ms 100]\n";
+                     "         --angle signed_integer_degrees --duration seconds [--period-ms 100]\n"
+                     "         [--write-without-response] uses unacknowledged periodic BLE writes;\n"
+                     "         the final Neutral stop still requests an ATT response.\n";
         return 0;
+      }
+      if (key == "--write-without-response") {
+        writeWithoutResponse = true;
+        continue;
       }
       if (!args.count(key) || ++i >= argc) throw std::invalid_argument("unknown/incomplete option: " + key);
       args[key] = argv[i];
@@ -49,6 +57,8 @@ int main(int argc, char** argv) {
     controlling = !args["--mode"].empty() || !args["--speed"].empty() || !args["--angle"].empty();
     if (duration < 0 || duration > 3600 || period < 20 || period > 200 || (controlling && !duration))
       throw std::invalid_argument("duration must be 0..3600 (positive for control), period 20..200 ms");
+    if (writeWithoutResponse && !controlling)
+      throw std::invalid_argument("--write-without-response requires control mode");
     neuroexo::Control command{neuroexo::Mode::Neutral, neuroexo::Speed::Slow, 0};
     if (controlling) {
       const std::map<std::string, neuroexo::Mode> modes = {
@@ -74,6 +84,7 @@ int main(int argc, char** argv) {
     using Clock = std::chrono::steady_clock;
     const auto started = Clock::now();
     auto due = started;
+    const auto periodDuration = std::chrono::milliseconds(period);
     while (!interrupted && (!duration || Clock::now() - started < std::chrono::seconds(duration))) {
       const auto latest = client.latestTelemetry(500);
       fault = latest.value.has(neuroexo::SafetyFault);
@@ -81,11 +92,23 @@ int main(int argc, char** argv) {
         throw std::runtime_error("Teensy fault; control transmission stopped");
       if (controlling && Clock::now() >= due) {
         controlStarted = true;
-        client.sendControl(command);
-        due = Clock::now() + std::chrono::milliseconds(period);
+        client.sendControl(command, !writeWithoutResponse);
+        due += periodDuration;
+        const auto afterWrite = Clock::now();
+        if (due <= afterWrite) due = afterWrite + periodDuration;
       }
-      // Short independent receive waits leave the command heartbeat scheduled.
-      const auto update = client.receiveTelemetry(10);
+      // Keep the receive wait inside the next absolute command deadline.
+      int receiveWaitMs = 10;
+      if (controlling) {
+        const auto remaining = due - Clock::now();
+        if (remaining <= Clock::duration::zero()) {
+          receiveWaitMs = 0;
+        } else {
+          const auto untilDue = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
+          receiveWaitMs = std::min(receiveWaitMs, int(untilDue));
+        }
+      }
+      const auto update = client.receiveTelemetry(receiveWaitMs);
       if (update) {
         std::cout << "RX " << neuroexo::describe(update->value) << std::endl;
         fault = update->value.has(neuroexo::SafetyFault);

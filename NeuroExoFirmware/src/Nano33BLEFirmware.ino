@@ -11,7 +11,7 @@ using namespace NeuroExoProtocol;
 // lost, duplicate and out-of-order packets plus arrival timing. Telemetry
 // polling and PMS keep running so the radio/CPU load stays realistic.
 // Counters reset on connect; a final summary prints on disconnect.
-#define BLE_PACKET_TEST 0
+#define BLE_PACKET_TEST 1
 
 // This Nano 33 BLE plays two roles:
 //  1. Mediator: BLE peripheral toward the BeagleBone Black (BLE central) <-> I2C

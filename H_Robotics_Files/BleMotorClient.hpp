@@ -19,7 +19,8 @@ class GattTransport {
   virtual ~GattTransport() = default;
   virtual void connect(const std::string& address, const std::string& adapter) = 0;
   virtual bool connected() const = 0;
-  virtual void writeControl(const ControlPacket& request, int timeoutMs) = 0;
+  virtual void writeControl(const ControlPacket& request, int timeoutMs,
+                            bool withResponse) = 0;
   virtual std::optional<TelemetryUpdate> receiveTelemetry(int timeoutMs) = 0;
   virtual std::optional<TelemetryUpdate> latestTelemetry() const = 0;
   virtual void disconnect() noexcept = 0;
@@ -33,7 +34,8 @@ class BleMotorClient {
   void connect(const std::string& address, const std::string& adapter = "hci0");
   void disconnect() noexcept;
   bool connected() const;
-  void sendControl(const Control& command);
+  // Periodic commands may skip the ATT response; stopMotor always requests one.
+  void sendControl(const Control& command, bool withResponse = true);
   void stopMotor();
   std::optional<TelemetryUpdate> receiveTelemetry(int timeoutMs = 100);
   // Throws on missing/stale telemetry or lost connection; never returns a fake zero.

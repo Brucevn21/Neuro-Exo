@@ -102,6 +102,13 @@ cmake --build build
   --mode assistive --speed slow --angle 30 --duration 5 --period-ms 100
 ```
 
+For high-rate testing, add `--write-without-response` to the C++ control
+command. The client checks the Nano's GATT flags before using BLE Write Without
+Response for periodic controls. Those writes have no ATT delivery confirmation;
+the final Neutral stop still requests a response. For a 50 Hz trial, set
+`--period-ms 20` and verify command reception and telemetry on the Nano/Teensy
+before relying on this mode.
+
 The standalone C++ target requires BlueZ on the system D-Bus and uses the same
 two UUIDs as Python. `--adapter hci1` selects a different adapter.
 

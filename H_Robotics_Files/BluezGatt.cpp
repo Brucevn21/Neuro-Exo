@@ -171,7 +171,8 @@ class BluezGatt final : public GattTransport, public PacketGatt {
     return size ? std::vector<uint8_t>(raw, raw + size) : std::vector<uint8_t>{};
   }
 
-  void writeControl(const ControlPacket& request, int timeoutMs) override {
+  void writeControl(const ControlPacket& request, int timeoutMs,
+                    bool withResponse) override {
     std::lock_guard<std::mutex> operation(operationMutex_);
     Control command;
     if (!decodeControl(request.data(), request.size(), command))
@@ -183,7 +184,10 @@ class BluezGatt final : public GattTransport, public PacketGatt {
     }
     GVariantBuilder options;
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options, "{sv}", "type", g_variant_new_string("request"));
+    if (!withResponse && !commandWriteWithoutResponse_)
+      throw std::runtime_error("command characteristic does not support writes without response");
+    g_variant_builder_add(&options, "{sv}", "type",
+                          g_variant_new_string(withResponse ? "request" : "command"));
     auto* bytes = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, request.data(), request.size(), 1);
     try {
       call(command_, "org.bluez.GattCharacteristic1", "WriteValue",
@@ -245,6 +249,7 @@ class BluezGatt final : public GattTransport, public PacketGatt {
     adapter_.clear(); device_.clear(); command_.clear(); event_.clear();
     control_.clear(); stats_.clear();
     packetWriteWithResponse_ = false;
+    commandWriteWithoutResponse_ = false;
   }
 
  private:
@@ -320,7 +325,11 @@ class BluezGatt final : public GattTransport, public PacketGatt {
         if (uuid == packetdemo::CONTROL) { destination = &control_; property = "write"; }
         if (uuid == packetdemo::STATS) { destination = &stats_; property = "read"; }
       } else {
-        if (uuid == COMMAND_UUID) { destination = &command_; property = "write"; }
+        if (uuid == COMMAND_UUID) {
+          destination = &command_;
+          property = "write";
+          commandWriteWithoutResponse_ = flag(p, "write-without-response");
+        }
         if (uuid == TELEMETRY_UUID) { destination = &event_; property = "notify"; }
       }
       if (destination) {
@@ -392,6 +401,7 @@ class BluezGatt final : public GattTransport, public PacketGatt {
   gulong closedHandler_ = 0;
   bool ownsDevice_ = false, notifying_ = false, online_ = false, unread_ = false;
   bool packetWriteWithResponse_ = false;
+  bool commandWriteWithoutResponse_ = false;
   std::optional<TelemetryUpdate> latest_;
   std::mutex operationMutex_;
   mutable std::mutex replyMutex_;
