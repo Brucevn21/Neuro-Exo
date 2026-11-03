@@ -11,7 +11,15 @@ using namespace NeuroExoProtocol;
 // lost, duplicate and out-of-order packets plus arrival timing. Telemetry
 // polling and PMS keep running so the radio/CPU load stays realistic.
 // Counters reset on connect; a final summary prints on disconnect.
+#ifndef BLE_PACKET_TEST
 #define BLE_PACKET_TEST 1
+#endif
+#ifndef BLE_PACKET_TEST_RX_ONLY
+#define BLE_PACKET_TEST_RX_ONLY 0
+#endif
+#if BLE_PACKET_TEST_RX_ONLY && !BLE_PACKET_TEST
+#error "RX-only firmware requires BLE_PACKET_TEST=1"
+#endif
 
 // This Nano 33 BLE plays two roles:
 //  1. Mediator: BLE peripheral toward the BeagleBone Black (BLE central) <-> I2C
@@ -77,7 +85,12 @@ void checkPowerSupply() {
   } else if (vIn > (PMS_THRESHOLD_VOLTAGE + PMS_HYSTERESIS) &&
              vIn < (PMS_OVERVOLTAGE_CUTOFF - PMS_HYSTERESIS)) {
     // Voltage is safe and inside both recovery thresholds. Connect load.
+    // A dedicated receive-only benchmark never enables the motor supply.
+#if BLE_PACKET_TEST_RX_ONLY
+    digitalWrite(PMS_RELAY_PIN, LOW);
+#else
     digitalWrite(PMS_RELAY_PIN, HIGH);
+#endif
   }
   // Otherwise, hold the current relay state (hysteresis dead zone).
 }
@@ -358,7 +371,9 @@ void setup() {
   digitalWrite(PMS_RELAY_PIN, LOW);
 
   Serial.begin(115200);
+#if !BLE_PACKET_TEST_RX_ONLY
   Wire.begin();
+#endif
 
   if (!BLE.begin()) {
     Serial.println("BLE failed to start!");
@@ -371,7 +386,9 @@ void setup() {
   // telemetry notifications aren't batched and dropped by a slower link.
   BLE.setConnectionInterval(6, 12);
   jointService.addCharacteristic(commandChar);
+#if !BLE_PACKET_TEST_RX_ONLY
   jointService.addCharacteristic(telemetryChar);
+#endif
   BLE.addService(jointService);
 #if BLE_PACKET_TEST
   commandChar.setEventHandler(BLEWritten, onTestCommandWritten);
@@ -382,6 +399,9 @@ void setup() {
 #if BLE_PACKET_TEST
   Serial.println("BLE PACKET TEST MODE: commands are counted, NOT forwarded to the Teensy.");
   Serial.println("Sender: control frames with targetAngleDeg = 0,1,2,... (one frame per write).");
+#if BLE_PACKET_TEST_RX_ONLY
+  Serial.println("RX-ONLY BENCHMARK: no telemetry, no I2C, motor relay OFF.");
+#endif
 #endif
 }
 
@@ -482,10 +502,12 @@ void loop() {
       }
 #endif
 
+#if !BLE_PACKET_TEST_RX_ONLY
       if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
         lastTelemetryTime += TELEMETRY_INTERVAL_MS;
         pollTeensyTelemetry();
       }
+#endif
     }
 
     Serial.println("Central disconnected");

@@ -73,6 +73,11 @@ python3 read_outputs.py ble-control --address AA:BB:CC:DD:EE:FF \
 When the Nano sketch has `BLE_PACKET_TEST` enabled, use this diagnostic
 command to send distinct packet sequence values over Write Without Response:
 
+For the current ProtocolDemo firmware, follow [the BBB sequence-test update
+procedure](SEQUENCE_TEST_BBB.md). The local `--sequence-test` adapter uses the
+current BLE UUIDs and 12-byte telemetry. Verify the Nano's test-mode startup
+banner before sending: normal firmware can interpret the sequence as an angle.
+
 ```sh
 python3 read_outputs.py ble-control --address AA:BB:CC:DD:EE:FF \
   --mode neutral --speed slow --angle 0 --duration 10 --period-ms 20 \

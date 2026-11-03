@@ -34,7 +34,9 @@ def add_modes(modes):
 
 
 class BleLink:
-    def __init__(self):
+    def __init__(self, command_uuid=COMMAND, telemetry_type=Telemetry):
+        self.command_uuid = command_uuid
+        self.telemetry_type = telemetry_type
         self.client = None
         self.queue = asyncio.Queue(maxsize=1)
         self.latest = None
@@ -43,7 +45,7 @@ class BleLink:
 
     def notification(self, characteristic, raw):
         try:
-            telemetry = Telemetry.decode(raw)
+            telemetry = self.telemetry_type.decode(raw)
         except ValueError:
             self.invalid_frames += 1
             return  # Corruption never refreshes feedback freshness.
@@ -78,7 +80,7 @@ class BleLink:
             raise ConnectionError(self.failure)
         # This completion is an ATT response from Nano, not a Teensy acknowledgment.
         await asyncio.wait_for(self.client.write_gatt_char(
-            COMMAND, command.encode(), response=with_response), 0.1)
+            self.command_uuid, command.encode(), response=with_response), 0.1)
 
 
 class Trace:
@@ -118,7 +120,8 @@ async def transmit(link, trace, command, period, freshness,
         current = command
         if sequence_test:
             angle = sequence if sequence < 0x8000 else sequence - 0x10000
-            # Keep the diagnostic inert if the test firmware was not flashed.
+            # Only BLE_PACKET_TEST firmware treats this angle as an ID.
+            # Normal firmware can move; verify the Nano's test-mode banner.
             current = Control(Mode.Neutral, Speed.Slow, angle)
             sequence = (sequence + 1) & 0xFFFF
         await link.send(current, with_response)
@@ -142,8 +145,8 @@ async def run_connected(link, args, trace):
         command = Control(Mode[args.motor_mode.title()], Speed[args.speed.title()], args.angle)
         tasks.append(asyncio.create_task(transmit(link, trace, command, args.period_ms / 1000,
                                                  args.telemetry_timeout,
-                                                 not args.write_without_response,
-                                                 args.sequence_test)))
+                                                 not getattr(args, "write_without_response", False),
+                                                 getattr(args, "sequence_test", False))))
     if args.duration:
         tasks.append(asyncio.create_task(asyncio.sleep(args.duration)))
     try:
@@ -156,7 +159,7 @@ async def run_connected(link, args, trace):
         await asyncio.gather(*tasks, return_exceptions=True)
         # Receive-only monitoring never sends a stop. Avoid extending a fault latch.
         fault = link.latest and link.latest[1].status & Status.SafetyFault
-        if controlling and not args.sequence_test and not link.failure and not fault:
+        if controlling and not getattr(args, "sequence_test", False) and not link.failure and not fault:
             try:
                 neutral = Control(Mode.Neutral, Speed.Slow, 0)
                 await link.send(neutral)
@@ -181,18 +184,25 @@ async def execute(args, stream=None):
         if not found:
             print("No NanoNeuroExo bridge found.")
         return 0 if found else 1
-    link = BleLink()
+    service, command_uuid, telemetry_uuid = SERVICE, COMMAND, TELEMETRY
+    telemetry_type = Telemetry
+    if getattr(args, "sequence_test", False):
+        from protocol_demo_sequence import (SERVICE as service, COMMAND as command_uuid,
+                                            TELEMETRY as telemetry_uuid, Telemetry as telemetry_type)
+        print("ProtocolDemo sequence test: Nano must have BLE_PACKET_TEST=1; "
+              "IDs start at 0. Normal firmware can move.", flush=True)
+    link = BleLink(command_uuid, telemetry_type)
     client = BleakClient(args.address, timeout=15, disconnected_callback=link.disconnected)
     link.client = client
     async with client:
-        for uuid, prop in ((COMMAND, "write"), (TELEMETRY, "notify")):
+        for uuid, prop in ((command_uuid, "write"), (telemetry_uuid, "notify")):
             char = client.services.get_characteristic(uuid)
-            if char is None or prop not in char.properties or char.service_uuid.lower() != SERVICE:
+            if char is None or prop not in char.properties or char.service_uuid.lower() != service:
                 raise RuntimeError("Nano motor service mismatch; flash NeuroExoFirmware with the nano33ble environment")
-            if (uuid == COMMAND and getattr(args, "write_without_response", False) and
+            if (uuid == command_uuid and getattr(args, "write_without_response", False) and
                     "write-without-response" not in char.properties):
                 raise RuntimeError("Nano command characteristic does not support Write Without Response")
-        await asyncio.wait_for(client.start_notify(TELEMETRY, link.notification), 10)
+        await asyncio.wait_for(client.start_notify(telemetry_uuid, link.notification), 10)
         trace = Trace(args.hex, stream)
         await run_connected(link, args, trace)
         if link.invalid_frames:
